@@ -1,6 +1,6 @@
 -- schema.sql
 -- docker exec -it trading-postgres psql -U walter -d trading_bot
-CREATE TABLE trades (
+CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
     ticker VARCHAR(10),
     action VARCHAR(10),  -- buy or sell
@@ -11,11 +11,16 @@ CREATE TABLE trades (
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE indicators (
+CREATE TABLE IF NOT EXISTS indicators (
     id SERIAL PRIMARY KEY,
     ticker VARCHAR(10),
     indicator_name VARCHAR(50),
     value FLOAT,
     timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS tickers (
+  id SERIAL PRIMARY KEY,
+  symbol VARCHAR(10) NOT NULL UNIQUE
 );
 
