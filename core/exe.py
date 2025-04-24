@@ -18,7 +18,6 @@ def run_bot(paper_mode=True):
             if paper_mode:
                 log_trade(ticker, decision['price'], paper=True)
             else:
-                # insert real trading API logic here
                 pass
 
             send_trade_alert(ticker, decision['price'], paper_mode)
