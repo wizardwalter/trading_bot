@@ -1,6 +1,6 @@
 # services/features/live_feature_engineering.py
 import pandas as pd
-from db import get_latest_candles
+from data.database import get_latest_candles
 from features.feature_engineering import generate_features
 
 def get_realtime_features(symbol: str, interval: str = '1m', lookback: int = 100):

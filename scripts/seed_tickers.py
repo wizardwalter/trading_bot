@@ -31,5 +31,8 @@ def insert_tickers():
     except Exception as e:
         print("❌ Error seeding tickers:", e)
 
+def get_tracked_tickers():
+    return tickers
+
 if __name__ == "__main__":
     insert_tickers()

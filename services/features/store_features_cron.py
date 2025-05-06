@@ -1,8 +1,8 @@
 # services/features/store_features_cron.py
 import pandas as pd
-from db import get_all_candles, insert_features_to_db
+from data.database import get_all_candles, insert_features_to_db
 from features.feature_engineering import generate_features
-from utils.tickers import get_tracked_tickers
+from scripts.seed_tickers import get_tracked_tickers
 
 def store_eod_features():
     for symbol in get_tracked_tickers():
