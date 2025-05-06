@@ -92,7 +92,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS candles_1h_unique_idx ON candles_1h (symbol, t
 
 CREATE TABLE IF NOT EXISTS shadow_trades (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(10) NOT NULL,
+    symbol VARCHAR(10) NOT NULL REFERENCES tickers(symbol),
     timeframe VARCHAR(10),
     decision VARCHAR(10), -- buy, sell, hold
     confidence FLOAT,
@@ -100,3 +100,22 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     timestamp TIMESTAMPTZ DEFAULT NOW(),
     outcome FLOAT -- % move after a set time, to evaluate false positives/negatives
 );
+
+
+CREATE TABLE IF NOT EXISTS features (
+    symbol TEXT NOT NULL REFERENCES tickers(symbol),
+    interval TEXT NOT NULL CHECK (interval IN ('1m', '5m', '15m', '1h', 'daily')),
+    timestamp TIMESTAMPTZ NOT NULL,
+    rsi FLOAT,
+    macd FLOAT,
+    macd_signal FLOAT,
+    macd_hist FLOAT,
+    ema_20 FLOAT,
+    ema_50 FLOAT,
+    bollinger_upper FLOAT,
+    bollinger_lower FLOAT,
+    obv FLOAT,
+    vwap FLOAT,
+    PRIMARY KEY (symbol, interval, timestamp)
+);
+CREATE INDEX IF NOT EXISTS idx_features_timestamp ON features(timestamp);

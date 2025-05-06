@@ -12,9 +12,10 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT")
 }
 
+# Only seed QQQ and SPY
 tickers = [
-    "BA", "META", "AMZN", "NFLX", "MSTR", "QQQ", "SPY", "DKNG", "NVDA",
-    "GOOGL", "ORCL", "LUNR", "DIS", "AMD", "IGM", "ABNB", "AVGO", "TSLA"
+    "QQQ",
+    "SPY"
 ]
 
 def insert_tickers():
