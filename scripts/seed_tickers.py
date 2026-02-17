@@ -12,11 +12,13 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT")
 }
 
-# Only seed QQQ and SPY
+# Phase 2 watchlist
 tickers = [
     "QQQ",
-    "SPY"
+    "SPY",
+    "BTC-USD",
 ]
+
 
 def insert_tickers():
     try:
@@ -31,8 +33,10 @@ def insert_tickers():
     except Exception as e:
         print("❌ Error seeding tickers:", e)
 
+
 def get_tracked_tickers():
     return tickers
+
 
 if __name__ == "__main__":
     insert_tickers()

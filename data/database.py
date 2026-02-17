@@ -16,13 +16,69 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT"),
 }
 
+STARTING_CASH = float(os.getenv("PAPER_STARTING_CASH", "100000"))
+
 
 def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
-def log_trade(ticker, price, paper=True):
-    print(f"📦 Logging trade: {ticker} @ ${price:.2f} [paper={paper}]")
+def log_trade(ticker, action, price, quantity, signal_strength=0.0, reason=""):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO trades (ticker, action, price, quantity, signal_strength, reason, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (ticker, action, float(price), int(quantity), float(signal_strength), reason),
+            )
+
+
+def get_position_qty(ticker: str) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(CASE WHEN action='buy' THEN quantity ELSE -quantity END), 0)
+                FROM trades
+                WHERE ticker=%s
+                """,
+                (ticker,),
+            )
+            return int(cur.fetchone()[0] or 0)
+
+
+def get_portfolio_equity(latest_prices: dict[str, float]) -> float:
+    cash = STARTING_CASH
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker, action, price, quantity FROM trades ORDER BY timestamp ASC")
+            rows = cur.fetchall()
+
+    positions: dict[str, int] = {}
+
+    for ticker, action, price, quantity in rows:
+        qty = int(quantity)
+        px = float(price)
+        if action == "buy":
+            cash -= px * qty
+            positions[ticker] = positions.get(ticker, 0) + qty
+        elif action == "sell":
+            cash += px * qty
+            positions[ticker] = positions.get(ticker, 0) - qty
+
+    mtm = 0.0
+    for ticker, qty in positions.items():
+        if qty <= 0:
+            continue
+        px = latest_prices.get(ticker)
+        if px is None:
+            continue
+        mtm += qty * float(px)
+
+    return cash + mtm
 
 
 def _candles_to_df(rows):
