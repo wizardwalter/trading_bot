@@ -3,18 +3,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict
 
+from core.market_hours import is_trade_window_open
+from core.risk import MAX_RISK_PER_TRADE, drawdown_exceeded
 from core.strategy import should_enter_trade, position_size
+from data.database import get_all_tickers, log_trade
 from discord.notify import send_trade_alert
-from data.database import (
-    get_all_tickers,
-    get_position_qty,
-    get_portfolio_equity,
-    log_trade,
-)
+from services.alpaca_broker import AlpacaBroker
 
 
 def run_bot(paper_mode: bool = True):
     print(f"[{datetime.utcnow().isoformat()}] 🚀 Trading bot started | paper_mode={paper_mode}")
+
+    broker = AlpacaBroker()
+    account = broker.get_account()
+    start_equity = float(account.get("equity", 0.0))
 
     tickers = get_all_tickers()
     if not tickers:
@@ -24,6 +26,16 @@ def run_bot(paper_mode: bool = True):
     latest_prices: Dict[str, float] = {}
 
     for ticker in tickers:
+        if not is_trade_window_open(ticker):
+            print(f"[{datetime.utcnow().isoformat()}] 🕒 Market closed for {ticker}, skipping")
+            continue
+
+        account_now = broker.get_account()
+        current_equity = float(account_now.get("equity", 0.0))
+        if drawdown_exceeded(start_equity, current_equity):
+            print("🛑 Daily drawdown limit reached. Halting trading loop.")
+            break
+
         print(f"[{datetime.utcnow().isoformat()}] 🔍 Analyzing {ticker}...")
         decision = should_enter_trade(ticker)
         latest_prices[ticker] = decision["price"]
@@ -33,36 +45,36 @@ def run_bot(paper_mode: bool = True):
             print(f"[{datetime.utcnow().isoformat()}] ⏭️ HOLD {ticker} | {decision['reason']}")
             continue
 
-        equity = get_portfolio_equity(latest_prices)
         qty = position_size(
-            equity=equity,
+            equity=current_equity,
             price=decision["price"],
             volatility=decision["volatility"],
-            max_risk_per_trade=0.01,
+            max_risk_per_trade=MAX_RISK_PER_TRADE,
         )
 
-        current_qty = get_position_qty(ticker)
+        current_qty = broker.get_position_qty(ticker)
         if action == "sell" and current_qty <= 0:
-            print(f"[{datetime.utcnow().isoformat()}] ⏭️ Skip SELL {ticker} (no long position)")
+            print(f"[{datetime.utcnow().isoformat()}] ⏭️ Skip SELL {ticker} (no position)")
             continue
 
         if action == "sell":
-            qty = min(qty, current_qty)
+            qty = min(qty, int(current_qty))
+
+        order = broker.submit_market_order(symbol=ticker, side=action, qty=qty)
 
         print(
             f"[{datetime.utcnow().isoformat()}] ✅ {action.upper()} {ticker} qty={qty} @ {decision['price']:.2f} "
             f"| conf={decision['confidence']:.2f}"
         )
 
-        if paper_mode:
-            log_trade(
-                ticker=ticker,
-                action=action,
-                price=decision["price"],
-                quantity=qty,
-                signal_strength=decision["confidence"],
-                reason=decision["reason"],
-            )
+        log_trade(
+            ticker=ticker,
+            action=action,
+            price=decision["price"],
+            quantity=qty,
+            signal_strength=decision["confidence"],
+            reason=decision["reason"],
+        )
 
         send_trade_alert(
             ticker=ticker,
@@ -70,9 +82,8 @@ def run_bot(paper_mode: bool = True):
             price=decision["price"],
             quantity=qty,
             confidence=decision["confidence"],
-            reason=decision["reason"],
+            reason=f"{decision['reason']} | order_id={order.get('id','n/a')}",
             paper=paper_mode,
         )
 
-    final_equity = get_portfolio_equity(latest_prices)
-    print(f"[{datetime.utcnow().isoformat()}] ✅ Trading session complete | est_equity=${final_equity:.2f}")
+    print(f"[{datetime.utcnow().isoformat()}] ✅ Trading session complete")
