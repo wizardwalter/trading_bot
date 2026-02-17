@@ -1,15 +1,7 @@
 import pandas as pd
 
+
 def calculate_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate Volume Weighted Average Price (VWAP).
-
-    Args:
-        df (pd.DataFrame): DataFrame with 'Close', 'High', 'Low', and 'Volume' columns.
-
-    Returns:
-        pd.DataFrame: Original DataFrame with an added 'VWAP' column.
-    """
     if not {'High', 'Low', 'Close', 'Volume'}.issubset(df.columns):
         raise ValueError("DataFrame must contain 'High', 'Low', 'Close', and 'Volume' columns.")
 
@@ -19,3 +11,7 @@ def calculate_vwap(df: pd.DataFrame) -> pd.DataFrame:
 
     df['VWAP'] = cumulative_vp / cumulative_volume
     return df
+
+
+def compute_vwap(df: pd.DataFrame) -> pd.Series:
+    return calculate_vwap(df.copy())['VWAP']
