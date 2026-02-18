@@ -24,15 +24,19 @@ def get_connection():
 
 
 def log_trade(ticker, action, price, quantity, signal_strength=0.0, reason=""):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO trades (ticker, action, price, quantity, signal_strength, reason, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                """,
-                (ticker, action, float(price), int(quantity), float(signal_strength), reason),
-            )
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO trades (ticker, action, price, quantity, signal_strength, reason, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (ticker, action, float(price), int(quantity), float(signal_strength), reason),
+                )
+    except Exception:
+        # DB optional during early bring-up; trading loop should still run.
+        return
 
 
 def get_position_qty(ticker: str) -> int:
@@ -119,10 +123,18 @@ def get_all_candles(symbol, interval):
 
 
 def get_all_tickers():
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT symbol FROM tickers ORDER BY symbol")
-            return [r[0] for r in cur.fetchall()]
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT symbol FROM tickers ORDER BY symbol")
+                out = [r[0] for r in cur.fetchall()]
+                if out:
+                    return out
+    except Exception:
+        pass
+
+    env_list = os.getenv("DEFAULT_TICKERS", "SPY,QQQ,BTC-USD")
+    return [s.strip() for s in env_list.split(",") if s.strip()]
 
 
 def insert_features_to_db(symbol, interval, features_df):

@@ -18,10 +18,13 @@ def run_loop(interval_seconds: int = 60, execute_orders: bool = False, status_ev
         run_bot(paper_mode=True, execute_orders=execute_orders)
 
         if loop_num % max(status_every_loops, 1) == 0:
-            perf = compute_performance()
-            send_status_update(
-                f"Loop {loop_num}: trades={perf.trade_count}, win_rate={perf.win_rate:.1%}, gross_pnl=${perf.gross_pnl:.2f}"
-            )
+            try:
+                perf = compute_performance()
+                send_status_update(
+                    f"Loop {loop_num}: trades={perf.trade_count}, win_rate={perf.win_rate:.1%}, gross_pnl=${perf.gross_pnl:.2f}"
+                )
+            except Exception as e:
+                send_status_update(f"Loop {loop_num}: running (performance DB unavailable: {e.__class__.__name__})")
 
         print(f"[{datetime.utcnow().isoformat()}] 💤 sleeping {interval_seconds}s")
         time.sleep(interval_seconds)
