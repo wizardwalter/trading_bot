@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict
 
@@ -18,19 +19,38 @@ class Signal:
     volatility: float
 
 
-def _download(symbol: str, interval: str = "5m", period: str = "5d") -> pd.DataFrame:
-    df = yf.download(tickers=symbol, interval=interval, period=period, progress=False)
-    if df.empty:
-        raise ValueError(f"No market data returned for {symbol}")
+def _download(symbol: str, interval: str = "5m", period: str = "5d", retries: int = 3) -> pd.DataFrame:
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            df = yf.download(
+                tickers=symbol,
+                interval=interval,
+                period=period,
+                progress=False,
+                threads=False,
+                auto_adjust=False,
+            )
+            if df.empty:
+                raise ValueError(f"No market data returned for {symbol}")
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
 
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing {col} in market data for {symbol}")
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                if col not in df.columns:
+                    raise ValueError(f"Missing {col} in market data for {symbol}")
 
-    return df.dropna().copy()
+            cleaned = df.dropna().copy()
+            if cleaned.empty:
+                raise ValueError(f"Only NaN market data returned for {symbol}")
+            return cleaned
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.6 * attempt)
+
+    raise ValueError(f"Market data fetch failed for {symbol}: {last_err}")
 
 
 def _features(df: pd.DataFrame) -> pd.DataFrame:
@@ -67,27 +87,36 @@ def build_signal(symbol: str) -> Signal:
     trend_component = max(min(trend_component * 220, 1.0), -1.0)
 
     if rsi < 35:
-        rsi_component = 0.7
-    elif rsi > 65:
-        rsi_component = -0.7
+        rsi_component = 0.8
+    elif rsi > 68:
+        rsi_component = -0.8
     else:
         rsi_component = 0.0
 
     momentum_component = max(min(ret_20 * 25, 1.0), -1.0)
 
-    score = (0.55 * trend_component) + (0.25 * momentum_component) + (0.20 * rsi_component)
+    score = (0.52 * trend_component) + (0.28 * momentum_component) + (0.20 * rsi_component)
 
-    if score > 0.35:
+    # Dynamic thresholds: in noisier conditions ask for stronger edge.
+    vol_penalty = min(max((vol - 0.01) * 8.0, 0.0), 0.10)
+    buy_threshold = 0.18 + vol_penalty
+    sell_threshold = -0.26 - vol_penalty
+
+    # Oversold bounce bias avoids a perpetual HOLD state in mild downtrends.
+    oversold_rebound = (rsi < 32 and momentum_component > -0.20)
+
+    if score > buy_threshold or oversold_rebound:
         action = "buy"
-    elif score < -0.35:
+    elif score < sell_threshold or rsi > 74:
         action = "sell"
     else:
         action = "hold"
 
-    confidence = min(abs(score), 1.0)
+    confidence = min(max((abs(score) - 0.05) / 0.65, 0.0), 1.0)
     reason = (
         f"trend={trend_component:+.2f}, momentum={momentum_component:+.2f}, "
-        f"rsi={rsi:.1f}, score={score:+.2f}"
+        f"rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
+        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}]"
     )
 
     return Signal(
