@@ -17,7 +17,13 @@ class AlpacaBroker:
     def __init__(self):
         if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
             raise RuntimeError("Alpaca API credentials are missing")
-        self.base_url = ALPACA_BASE_URL.rstrip("/")
+        base = ALPACA_BASE_URL.rstrip("/")
+        # Accept either base URL style:
+        # - https://paper-api.alpaca.markets
+        # - https://paper-api.alpaca.markets/v2
+        if base.endswith("/v2"):
+            base = base[:-3]
+        self.base_url = base
         self.session = requests.Session()
         self.session.headers.update(
             {
