@@ -72,8 +72,25 @@ def _features(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna()
 
 
+def _symbol_profile(symbol: str) -> dict:
+    s = symbol.upper()
+    if s == "BTC-USD":
+        return {
+            "interval": "1m",
+            "period": "2d",
+            "entry_threshold": 0.22,  # more active scalp profile
+        }
+    # default day-trading profile for equities
+    return {
+        "interval": "5m",
+        "period": "5d",
+        "entry_threshold": 0.35,
+    }
+
+
 def build_signal(symbol: str) -> Signal:
-    df = _features(_download(symbol))
+    profile = _symbol_profile(symbol)
+    df = _features(_download(symbol, interval=profile["interval"], period=profile["period"]))
     row = df.iloc[-1]
 
     price = float(row["Close"])
@@ -97,10 +114,11 @@ def build_signal(symbol: str) -> Signal:
 
     score = (0.52 * trend_component) + (0.28 * momentum_component) + (0.20 * rsi_component)
 
-    # Dynamic thresholds: in noisier conditions ask for stronger edge.
+    # Dynamic thresholds: per-symbol baseline + volatility penalty.
+    base_threshold = float(profile["entry_threshold"])
     vol_penalty = min(max((vol - 0.01) * 8.0, 0.0), 0.10)
-    buy_threshold = 0.18 + vol_penalty
-    sell_threshold = -0.26 - vol_penalty
+    buy_threshold = base_threshold + vol_penalty
+    sell_threshold = -base_threshold - vol_penalty
 
     # Oversold bounce bias avoids a perpetual HOLD state in mild downtrends.
     oversold_rebound = (rsi < 32 and momentum_component > -0.20)
