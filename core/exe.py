@@ -11,8 +11,10 @@ from discord.notify import send_trade_alert
 from services.alpaca_broker import AlpacaBroker
 
 
-def run_bot(paper_mode: bool = True):
-    print(f"[{datetime.utcnow().isoformat()}] 🚀 Trading bot started | paper_mode={paper_mode}")
+def run_bot(paper_mode: bool = True, execute_orders: bool = False):
+    print(
+        f"[{datetime.utcnow().isoformat()}] 🚀 Trading bot started | paper_mode={paper_mode} | execute_orders={execute_orders}"
+    )
 
     broker = AlpacaBroker()
     account = broker.get_account()
@@ -60,7 +62,12 @@ def run_bot(paper_mode: bool = True):
         if action == "sell":
             qty = min(qty, int(current_qty))
 
-        order = broker.submit_market_order(symbol=ticker, side=action, qty=qty)
+        if execute_orders:
+            order = broker.submit_market_order(symbol=ticker, side=action, qty=qty)
+            order_id = order.get("id", "n/a")
+            reason = f"{decision['reason']} | order_id={order_id}"
+        else:
+            reason = f"{decision['reason']} | dry_run=true"
 
         print(
             f"[{datetime.utcnow().isoformat()}] ✅ {action.upper()} {ticker} qty={qty} @ {decision['price']:.2f} "
@@ -73,7 +80,7 @@ def run_bot(paper_mode: bool = True):
             price=decision["price"],
             quantity=qty,
             signal_strength=decision["confidence"],
-            reason=decision["reason"],
+            reason=reason,
         )
 
         send_trade_alert(
@@ -82,7 +89,7 @@ def run_bot(paper_mode: bool = True):
             price=decision["price"],
             quantity=qty,
             confidence=decision["confidence"],
-            reason=f"{decision['reason']} | order_id={order.get('id','n/a')}",
+            reason=reason,
             paper=paper_mode,
         )
 
