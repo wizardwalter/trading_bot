@@ -65,6 +65,7 @@ def _features(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain.rolling(14).mean() / loss.rolling(14).mean()
     out["rsi"] = 100 - (100 / (1 + rs))
 
+    out["ret_3"] = out["Close"].pct_change(3)
     out["ret_20"] = out["Close"].pct_change(20)
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["volatility"] = out["hl_spread"].rolling(20).mean()
@@ -78,13 +79,13 @@ def _symbol_profile(symbol: str) -> dict:
         return {
             "interval": "1m",
             "period": "2d",
-            "entry_threshold": 0.22,  # more active scalp profile
+            "entry_threshold": 0.18,  # active scalp profile, but still guarded
         }
     # default day-trading profile for equities
     return {
         "interval": "5m",
         "period": "5d",
-        "entry_threshold": 0.35,
+        "entry_threshold": 0.12,
     }
 
 
@@ -97,6 +98,7 @@ def build_signal(symbol: str) -> Signal:
     ema_fast = float(row["ema_fast"])
     ema_slow = float(row["ema_slow"])
     rsi = float(row["rsi"])
+    ret_3 = float(row["ret_3"])
     ret_20 = float(row["ret_20"])
     vol = max(float(row["volatility"]), 0.002)
 
@@ -111,8 +113,14 @@ def build_signal(symbol: str) -> Signal:
         rsi_component = 0.0
 
     momentum_component = max(min(ret_20 * 25, 1.0), -1.0)
+    short_momentum_component = max(min(ret_3 * 35, 1.0), -1.0)
 
-    score = (0.52 * trend_component) + (0.28 * momentum_component) + (0.20 * rsi_component)
+    score = (
+        (0.44 * trend_component)
+        + (0.22 * momentum_component)
+        + (0.20 * short_momentum_component)
+        + (0.14 * rsi_component)
+    )
 
     # Dynamic thresholds: per-symbol baseline + volatility penalty.
     base_threshold = float(profile["entry_threshold"])
@@ -120,8 +128,8 @@ def build_signal(symbol: str) -> Signal:
     buy_threshold = base_threshold + vol_penalty
     sell_threshold = -base_threshold - vol_penalty
 
-    # Oversold bounce bias avoids a perpetual HOLD state in mild downtrends.
-    oversold_rebound = (rsi < 32 and momentum_component > -0.20)
+    # Oversold rebound bias only triggers when very short-term momentum improves.
+    oversold_rebound = (rsi < 30 and short_momentum_component > momentum_component + 0.10)
 
     if score > buy_threshold or oversold_rebound:
         action = "buy"
@@ -130,10 +138,14 @@ def build_signal(symbol: str) -> Signal:
     else:
         action = "hold"
 
-    confidence = min(max((abs(score) - 0.05) / 0.65, 0.0), 1.0)
+    # Suppress low-conviction churn around neutral conditions.
+    if abs(score) < 0.06 and not oversold_rebound:
+        action = "hold"
+
+    confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
     reason = (
-        f"trend={trend_component:+.2f}, momentum={momentum_component:+.2f}, "
-        f"rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
+        f"trend={trend_component:+.2f}, momentum20={momentum_component:+.2f}, "
+        f"momentum3={short_momentum_component:+.2f}, rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
         f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}]"
     )
 

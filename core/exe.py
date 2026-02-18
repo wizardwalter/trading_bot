@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Dict
 
@@ -9,6 +10,9 @@ from core.strategy import position_size, should_enter_trade
 from data.database import get_all_tickers, log_trade
 from discord.notify import send_trade_alert
 from services.alpaca_broker import AlpacaBroker
+
+
+MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.12"))
 
 
 def run_bot(paper_mode: bool = True, execute_orders: bool = False):
@@ -58,6 +62,13 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
                 print(f"[{datetime.utcnow().isoformat()}] ⏭️ Skip SELL {ticker} (no position)")
+                continue
+
+            if decision["confidence"] < MIN_SIGNAL_CONFIDENCE and action == "buy":
+                print(
+                    f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                    f"(low confidence={decision['confidence']:.2f} < {MIN_SIGNAL_CONFIDENCE:.2f})"
+                )
                 continue
 
             if action == "sell":
