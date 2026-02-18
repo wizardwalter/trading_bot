@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 
@@ -18,13 +19,17 @@ def run_loop(interval_seconds: int = 60, execute_orders: bool = False, status_ev
         run_bot(paper_mode=True, execute_orders=execute_orders)
 
         if loop_num % max(status_every_loops, 1) == 0:
-            try:
-                perf = compute_performance()
-                send_status_update(
-                    f"Loop {loop_num}: trades={perf.trade_count}, win_rate={perf.win_rate:.1%}, gross_pnl=${perf.gross_pnl:.2f}"
-                )
-            except Exception as e:
-                send_status_update(f"Loop {loop_num}: running (performance DB unavailable: {e.__class__.__name__})")
+            use_db_perf = os.getenv("ENABLE_DB_PERF", "0") == "1"
+            if use_db_perf:
+                try:
+                    perf = compute_performance()
+                    send_status_update(
+                        f"Loop {loop_num}: trades={perf.trade_count}, win_rate={perf.win_rate:.1%}, gross_pnl=${perf.gross_pnl:.2f}"
+                    )
+                except Exception:
+                    send_status_update(f"Loop {loop_num}: running (DB perf unavailable)")
+            else:
+                send_status_update(f"Loop {loop_num}: running")
 
         print(f"[{datetime.utcnow().isoformat()}] 💤 sleeping {interval_seconds}s")
         time.sleep(interval_seconds)
