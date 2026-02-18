@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict
 
 from core.market_hours import is_trade_window_open
-from core.risk import MAX_RISK_PER_TRADE, drawdown_exceeded, exceeds_portfolio_exposure
+from core.risk import MAX_RISK_PER_TRADE, POSITION_FRACTION, drawdown_exceeded, exceeds_portfolio_exposure
 from core.strategy import position_size, should_enter_trade
 from data.database import get_all_tickers, log_trade
 from discord.notify import send_trade_alert
@@ -52,12 +52,16 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 print(f"[{datetime.utcnow().isoformat()}] ⏭️ HOLD {ticker} | {decision['reason']}")
                 continue
 
-            qty = position_size(
+            qty_risk = position_size(
                 equity=current_equity,
                 price=decision["price"],
                 volatility=decision["volatility"],
                 max_risk_per_trade=MAX_RISK_PER_TRADE,
             )
+            buying_power = broker.get_buying_power()
+            qty_bp = max(int((buying_power * POSITION_FRACTION) / max(decision["price"], 0.01)), 1)
+            # Use the tighter of risk sizing and 10%-buying-power sizing.
+            qty = max(min(qty_risk, qty_bp), 1)
 
             current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
@@ -92,9 +96,15 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             if execute_orders:
                 order = broker.submit_market_order(symbol=ticker, side=action, qty=qty)
                 order_id = order.get("id", "n/a")
-                reason = f"{decision['reason']} | order_id={order_id}"
+                reason = (
+                    f"{decision['reason']} | order_id={order_id} "
+                    f"| qty_risk={qty_risk} qty_bp={qty_bp} bp={buying_power:.2f}"
+                )
             else:
-                reason = f"{decision['reason']} | dry_run=true"
+                reason = (
+                    f"{decision['reason']} | dry_run=true "
+                    f"| qty_risk={qty_risk} qty_bp={qty_bp} bp={buying_power:.2f}"
+                )
 
             print(
                 f"[{datetime.utcnow().isoformat()}] ✅ {action.upper()} {ticker} qty={qty} @ {decision['price']:.2f} "

@@ -79,7 +79,7 @@ def _symbol_profile(symbol: str) -> dict:
         return {
             "interval": "1m",
             "period": "2d",
-            "entry_threshold": 0.18,  # active scalp profile, but still guarded
+            "entry_threshold": 0.10,  # aggressive scalp profile for faster entries/exits
         }
     # default day-trading profile for equities
     return {
