@@ -67,9 +67,9 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 max_risk_per_trade=MAX_RISK_PER_TRADE,
             )
             buying_power = broker.get_buying_power()
-            qty_bp = max(int((buying_power * POSITION_FRACTION) / max(decision["price"], 0.01)), 1)
-            # Use the tighter of risk sizing and 10%-buying-power sizing.
-            qty = max(min(qty_risk, qty_bp), 1)
+            qty_bp = int((buying_power * POSITION_FRACTION) / max(decision["price"], 0.01))
+            # Use the tighter of risk sizing and buying-power sizing.
+            qty = min(qty_risk, qty_bp)
 
             current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
@@ -86,6 +86,13 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             if action == "sell":
                 # Exit the full position on sell signal; avoids partial dribble exits.
                 qty = int(current_qty)
+
+            if action == "buy" and qty <= 0:
+                print(
+                    f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                    f"(size=0 | qty_risk={qty_risk} qty_bp={qty_bp} bp={buying_power:.2f})"
+                )
+                continue
 
             if action == "buy":
                 positions = broker.get_positions()

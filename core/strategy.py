@@ -147,11 +147,20 @@ def build_signal(symbol: str) -> Signal:
     if abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
         action = "hold"
 
-    confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
+    base_confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
+    setup_confidence_boost = 0.0
+    if oversold_rebound:
+        setup_confidence_boost = max(setup_confidence_boost, 0.07)
+    if extreme_oversold_reversal:
+        setup_confidence_boost = max(setup_confidence_boost, 0.10)
+    if overbought_exhaustion and action == "hold":
+        setup_confidence_boost = max(setup_confidence_boost, 0.05)
+
+    confidence = min(base_confidence + setup_confidence_boost, 1.0)
     reason = (
         f"trend={trend_component:+.2f}, momentum20={momentum_component:+.2f}, "
         f"momentum3={short_momentum_component:+.2f}, rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
-        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}]"
+        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], conf={confidence:.2f}"
     )
 
     return Signal(
@@ -166,10 +175,12 @@ def build_signal(symbol: str) -> Signal:
 
 
 def position_size(equity: float, price: float, volatility: float, max_risk_per_trade: float = 0.01) -> int:
-    risk_budget = max(equity, 1.0) * max_risk_per_trade
+    risk_budget = max(equity, 0.0) * max_risk_per_trade
     risk_per_unit = price * max(volatility, 0.005)
+    if risk_per_unit <= 0:
+        return 0
     qty = int(risk_budget / risk_per_unit)
-    return max(qty, 1)
+    return max(qty, 0)
 
 
 def should_enter_trade(ticker: str) -> Dict:
