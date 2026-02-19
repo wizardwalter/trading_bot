@@ -60,14 +60,24 @@ class AlpacaBroker:
         except Exception:
             return 0.0
 
-    def submit_market_order(self, symbol: str, side: str, qty: int) -> dict:
+    def submit_market_order(self, symbol: str, side: str, qty: float) -> dict:
+        raw_symbol = symbol
         symbol = _to_alpaca_symbol(symbol)
+        is_crypto = "-" in (raw_symbol or "")
+
+        if is_crypto:
+            qty_str = f"{float(qty):.6f}".rstrip("0").rstrip(".")
+            tif = "gtc"
+        else:
+            qty_str = str(int(float(qty)))
+            tif = "day"
+
         payload = {
             "symbol": symbol,
-            "qty": str(int(qty)),
+            "qty": qty_str,
             "side": side,
             "type": "market",
-            "time_in_force": "day",
+            "time_in_force": tif,
         }
         r = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=15)
         r.raise_for_status()

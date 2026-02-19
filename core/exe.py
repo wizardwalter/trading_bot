@@ -21,6 +21,18 @@ from services.alpaca_broker import AlpacaBroker
 MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.12"))
 MAX_SYMBOL_EXPOSURE = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0.18"))
 MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "25"))
+CRYPTO_QTY_PRECISION = int(os.getenv("CRYPTO_QTY_PRECISION", "6"))
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    return "-" in (symbol or "")
+
+
+def _normalize_qty(symbol: str, qty: float) -> float:
+    q = max(float(qty), 0.0)
+    if _is_crypto_symbol(symbol):
+        return round(q, CRYPTO_QTY_PRECISION)
+    return float(int(q))
 
 
 def run_bot(paper_mode: bool = True, execute_orders: bool = False):
@@ -67,9 +79,10 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 max_risk_per_trade=MAX_RISK_PER_TRADE,
             )
             buying_power = broker.get_buying_power()
-            qty_bp = int((buying_power * POSITION_FRACTION) / max(decision["price"], 0.01))
+            qty_bp_raw = (buying_power * POSITION_FRACTION) / max(decision["price"], 0.01)
+            qty_bp = _normalize_qty(ticker, qty_bp_raw)
             # Use the tighter of risk sizing and buying-power sizing.
-            qty = min(qty_risk, qty_bp)
+            qty = min(float(qty_risk), float(qty_bp))
 
             current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
@@ -85,7 +98,7 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
 
             if action == "sell":
                 # Exit the full position on sell signal; avoids partial dribble exits.
-                qty = int(current_qty)
+                qty = _normalize_qty(ticker, float(current_qty))
 
             if action == "buy" and qty <= 0:
                 print(
@@ -104,14 +117,20 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 # Hard-cap aggregate long exposure and downsize qty to fit remaining room.
                 max_allowed_exposure = max(current_equity * MAX_PORTFOLIO_EXPOSURE, 0.0)
                 remaining_exposure = max(max_allowed_exposure - current_exposure, 0.0)
-                qty_exposure = int(remaining_exposure / max(float(decision["price"]), 0.01))
+                qty_exposure = _normalize_qty(
+                    ticker,
+                    remaining_exposure / max(float(decision["price"]), 0.01),
+                )
 
                 # Cap concentration per symbol as an additional stability guard.
                 max_symbol_exposure = max(current_equity * MAX_SYMBOL_EXPOSURE, 0.0)
                 remaining_symbol_exposure = max(max_symbol_exposure - current_symbol_exposure, 0.0)
-                qty_symbol_cap = int(remaining_symbol_exposure / max(float(decision["price"]), 0.01))
+                qty_symbol_cap = _normalize_qty(
+                    ticker,
+                    remaining_symbol_exposure / max(float(decision["price"]), 0.01),
+                )
 
-                qty = min(qty, qty_exposure, qty_symbol_cap)
+                qty = _normalize_qty(ticker, min(qty, qty_exposure, qty_symbol_cap))
 
                 if qty <= 0:
                     print(
@@ -121,7 +140,7 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                     )
                     continue
 
-                trade_notional = float(decision["price"]) * max(int(qty), 0)
+                trade_notional = float(decision["price"]) * max(float(qty), 0.0)
                 if trade_notional < MIN_ORDER_NOTIONAL:
                     print(
                         f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
