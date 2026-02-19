@@ -62,8 +62,8 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     m3 = (out["ret_3"] * 35).clip(-1, 1)
 
     rsi_comp = np.where(out["rsi"] < 33, 0.8, np.where(out["rsi"] > 70, -0.8, 0.0))
-    # Heavier trend weighting + lighter short-momentum noise improves regime filtering.
-    out["score"] = 0.48 * trend + 0.22 * m20 + 0.10 * m3 + 0.20 * rsi_comp
+    # Bias toward RSI mean-reversion while preserving trend context for fewer whipsaws.
+    out["score"] = 0.35 * trend + 0.15 * m20 + 0.05 * m3 + 0.45 * rsi_comp
     out["trend"] = trend
     out["m3"] = m3
     out["m20"] = m20
@@ -194,77 +194,36 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 def pick_best(train_df: pd.DataFrame) -> Metrics:
     candidates = np.arange(0.05, 0.71, 0.01)
 
-    # Use a simple internal walk-forward split so threshold tuning is less likely
-    # to overfit to the earliest segment of the train window.
-    inner_split = int(len(train_df) * 0.7)
-    inner_split = max(120, min(len(train_df) - 80, inner_split))
-    fit_df = train_df.iloc[:inner_split]
-    val_df = train_df.iloc[inner_split:]
-
-    if len(fit_df) < 80 or len(val_df) < 40:
-        scored = [simulate(train_df, th) for th in candidates]
-        return max(
-            scored,
-            key=lambda m: (
-                m.total_return,
-                m.max_drawdown,
-                m.sharpe_like,
-                -abs(m.trades - 30),
-                -m.threshold,
-            ),
-        )
-
-    ranked: list[tuple[float, Metrics, Metrics]] = []
+    scored: list[tuple[float, Metrics]] = []
     for th in candidates:
-        fit = simulate(fit_df, th)
-        val = simulate(val_df, th)
-
-        # Score favors validation robustness, while penalizing deep drawdowns and
-        # strongly negative fit behavior.
+        m = simulate(train_df, th)
         score = (
-            (val.total_return * 2.8)
-            + (val.expectancy * 180.0)
-            + (val.sharpe_like * 0.06)
-            + (val.max_drawdown * 0.22)
-            - (0.55 if fit.max_drawdown < -0.18 else 0.0)
-            - (0.45 if fit.total_return < -0.06 else 0.0)
-            - (0.20 if val.trades < 4 else 0.0)
+            (m.total_return * 3.0)
+            + (m.sharpe_like * 0.05)
+            + (m.max_drawdown * 0.20)
+            - (0.25 if m.trades < 6 else 0.0)
+            - (0.15 if m.max_drawdown < -0.12 else 0.0)
         )
-        ranked.append((score, fit, val))
+        scored.append((score, m))
 
-    # Prefer active-but-defensive settings when available.
+    # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
     viable = [
-        (score, fit, val)
-        for score, fit, val in ranked
-        if val.max_drawdown >= -0.10 and fit.max_drawdown >= -0.15
+        (score, m)
+        for score, m in scored
+        if m.total_return > 0 and m.max_drawdown >= -0.12 and m.trades >= 6
     ]
 
     if viable:
-        chosen = max(
+        return max(
             viable,
-            key=lambda x: (
-                x[0],
-                x[2].total_return,
-                x[2].expectancy,
-                x[2].sharpe_like,
-                -abs(x[2].trades - 24),
-                -x[2].threshold,
-            ),
-        )
-        return simulate(train_df, chosen[2].threshold)
+            key=lambda x: (x[0], x[1].total_return, x[1].sharpe_like, -abs(x[1].trades - 16), -x[1].threshold),
+        )[1]
 
-    # Fallback: most defensive threshold over the full training slice.
-    scored = [simulate(train_df, th) for th in candidates]
+    # Fallback: least-bad threshold by blended return/risk score.
     return max(
         scored,
-        key=lambda m: (
-            m.total_return,
-            m.max_drawdown,
-            m.sharpe_like,
-            -abs(m.trades - 20),
-            -m.threshold,
-        ),
-    )
+        key=lambda x: (x[0], x[1].total_return, x[1].max_drawdown, x[1].sharpe_like, -x[1].threshold),
+    )[1]
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
