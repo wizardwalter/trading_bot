@@ -136,15 +136,20 @@ def build_signal(symbol: str) -> Signal:
     # Avoid fresh long entries during euphoric spikes.
     overbought_exhaustion = rsi > 78 and short_momentum_component > 0.10
 
+    # Exit logic: trim risk on clear downside, and also de-risk overbought conditions
+    # once short-term momentum stops accelerating higher.
+    overbought_exit = rsi > 74 and short_momentum_component < 0.08
+
     if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion:
         action = "buy"
-    elif score < sell_threshold or rsi > 74:
+    elif score < sell_threshold or overbought_exit:
         action = "sell"
     else:
         action = "hold"
 
-    # Suppress low-conviction churn around neutral conditions.
-    if abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
+    # Suppress low-conviction long entries around neutral conditions, but do not mask
+    # explicit risk-off exits (sell threshold / overbought exit).
+    if action == "buy" and abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
         action = "hold"
 
     base_confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
