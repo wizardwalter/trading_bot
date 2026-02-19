@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -15,13 +16,20 @@ TRAINING_WEBHOOK_URL = os.getenv("TRAINING_WEBHOOK_URL")
 def _send_to(url: str | None, content: str):
     if not url:
         return False
-    for _ in range(3):
+
+    for attempt in range(3):
         try:
             r = requests.post(url, json={"content": content}, timeout=10)
             if 200 <= r.status_code < 300:
                 return True
+            # Retry on rate limits/server errors.
+            if r.status_code not in (429, 500, 502, 503, 504):
+                return False
         except Exception:
             pass
+
+        if attempt < 2:
+            time.sleep(0.6 * (attempt + 1))
     return False
 
 
