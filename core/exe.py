@@ -23,6 +23,7 @@ MAX_SYMBOL_EXPOSURE = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0.18"))
 MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "25"))
 MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "250"))
 CRYPTO_QTY_PRECISION = int(os.getenv("CRYPTO_QTY_PRECISION", "6"))
+ALLOW_PYRAMIDING = os.getenv("ALLOW_PYRAMIDING", "0") == "1"
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
@@ -98,6 +99,13 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
                 print(f"[{datetime.utcnow().isoformat()}] ⏭️ Skip SELL {ticker} (no position)")
+                continue
+
+            if action == "buy" and current_qty > 0 and not ALLOW_PYRAMIDING:
+                print(
+                    f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                    f"(already in position qty={current_qty}, pyramiding disabled)"
+                )
                 continue
 
             if decision["confidence"] < MIN_SIGNAL_CONFIDENCE and action == "buy":

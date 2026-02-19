@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -12,11 +13,23 @@ OUT_DIR = Path("data/backtests")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d") -> pd.DataFrame:
-    df = yf.download(symbol, interval=interval, period=period, progress=False, threads=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    return df.dropna().copy()
+def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", retries: int = 4) -> pd.DataFrame:
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            df = yf.download(symbol, interval=interval, period=period, progress=False, threads=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            cleaned = df.dropna().copy()
+            if cleaned.empty:
+                raise ValueError(f"No market data returned for {symbol}")
+            return cleaned
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.6 * attempt)
+
+    raise RuntimeError(f"download failed for {symbol} after {retries} attempts: {last_err}")
 
 
 def features(df: pd.DataFrame) -> pd.DataFrame:
@@ -44,6 +57,7 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
 
     rsi_comp = np.where(out["rsi"] < 35, 0.8, np.where(out["rsi"] > 68, -0.8, 0.0))
     out["score"] = 0.44 * trend + 0.22 * m20 + 0.20 * m3 + 0.14 * rsi_comp
+    out["trend"] = trend
     out["m3"] = m3
     out["m20"] = m20
     return out
@@ -60,20 +74,84 @@ class Metrics:
     max_drawdown: float
 
 
+def _signals_long_only(df: pd.DataFrame, threshold: float) -> np.ndarray:
+    score = df["score"].values
+    rsi = df["rsi"].values
+    m3 = df["m3"].values
+    m20 = df["m20"].values
+    trend = df["trend"].values
+    vol = df["volatility"].values
+
+    buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
+    sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
+
+    overbought_exit = (rsi > 74) & (m3 < 0.08)
+    bearish_confirmation = (trend < -0.03) & (m3 < 0.0)
+    risk_off_regime = ((trend < -0.06) & (m20 < -0.08)) | (vol > 0.02)
+
+    oversold_rebound = (rsi < 30) & (m3 > (m20 + 0.10))
+    extreme_oversold_reversal = (rsi < 27) & (m3 > -0.15)
+    overbought_exhaustion = (rsi > 78) & (m3 > 0.10)
+
+    want_buy = (score > buy_threshold) | oversold_rebound | extreme_oversold_reversal
+    want_buy = want_buy & (~overbought_exhaustion) & (~risk_off_regime)
+
+    want_sell = overbought_exit | ((score < sell_threshold) & bearish_confirmation) | risk_off_regime
+
+    signal = np.zeros(len(df), dtype=np.int8)
+    in_pos = False
+    cooldown = 0
+
+    for i in range(len(df)):
+        if cooldown > 0:
+            cooldown -= 1
+
+        if not in_pos:
+            if cooldown == 0 and want_buy[i]:
+                signal[i] = 1
+                in_pos = True
+        else:
+            if want_sell[i]:
+                signal[i] = -1
+                in_pos = False
+                cooldown = 2  # avoid immediate churn in noisy bars
+
+    return signal
+
+
 def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_bps: float = 2.0) -> Metrics:
+    if df.empty:
+        return Metrics(
+            threshold=float(threshold),
+            trades=0,
+            win_rate=0.0,
+            expectancy=0.0,
+            total_return=0.0,
+            sharpe_like=0.0,
+            max_drawdown=0.0,
+        )
+
     fee = fee_bps / 10_000
     slippage = slippage_bps / 10_000
 
-    score = df["score"].values
-    signal = np.where(score > threshold, 1, np.where(score < -threshold, -1, 0))
+    signal = _signals_long_only(df, threshold)
 
-    # position at next bar open/close approximation
-    position = pd.Series(signal).shift(1).fillna(0).values
+    # Convert event signal (buy/sell actions) to position state.
+    position = np.zeros(len(signal), dtype=float)
+    in_pos = 0.0
+    for i, sig in enumerate(signal):
+        if sig == 1:
+            in_pos = 1.0
+        elif sig == -1:
+            in_pos = 0.0
+        position[i] = in_pos
+
+    # Position applies from the next bar onward.
+    position = pd.Series(position).shift(1).fillna(0).values
 
     rets = df["Close"].pct_change().fillna(0).values
     strat = position * rets
 
-    # costs when position changes
     turns = np.abs(np.diff(np.r_[0, position]))
     costs = turns * (fee + slippage)
     strat = strat - costs
@@ -83,9 +161,9 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
     trade_mask = turns > 0
     trade_rets = pd.Series(strat)[trade_mask]
-    trades = int(trade_mask.sum())
-    win_rate = float((trade_rets > 0).mean()) if trades else 0.0
-    expectancy = float(trade_rets.mean()) if trades else 0.0
+    trades = int((signal == 1).sum())
+    win_rate = float((trade_rets > 0).mean()) if len(trade_rets) else 0.0
+    expectancy = float(trade_rets.mean()) if len(trade_rets) else 0.0
 
     vol = float(pd.Series(strat).std())
     sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(252 * 24 * 12)) if vol > 0 else 0.0
@@ -106,17 +184,28 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
-    candidates = np.arange(0.04, 0.22, 0.01)
+    candidates = np.arange(0.06, 0.26, 0.01)
     scored = [simulate(train_df, th) for th in candidates]
 
-    # objective: favor return but penalize drawdown and zero-trade configs
-    scored.sort(key=lambda m: (m.total_return + (m.sharpe_like * 0.05) + (m.expectancy * 1000) + m.max_drawdown), reverse=True)
+    # Objective: prioritize robust equity growth, then risk-adjusted return, then drawdown control.
+    scored.sort(
+        key=lambda m: (
+            m.total_return,
+            m.sharpe_like,
+            m.expectancy * 1000,
+            m.max_drawdown,
+            -m.trades,
+        ),
+        reverse=True,
+    )
     return scored[0]
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     raw = download(symbol=symbol, interval=interval, period=period)
     df = features(raw)
+    if len(df) < 200:
+        raise RuntimeError(f"insufficient feature rows for backtest: {len(df)}")
 
     split = int(len(df) * 0.7)
     train_df = df.iloc[:split]

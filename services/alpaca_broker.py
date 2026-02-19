@@ -35,16 +35,32 @@ class AlpacaBroker:
             }
         )
 
-    def _request(self, method: str, path: str, timeout: int = 15, retries: int = 3, **kwargs):
+    def _request(self, method: str, path: str, timeout: int = 15, retries: int = 4, **kwargs):
         last_err: Exception | None = None
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+
         for attempt in range(1, retries + 1):
             try:
                 response = self.session.request(method, f"{self.base_url}{path}", timeout=timeout, **kwargs)
+
+                if response.status_code in retryable_statuses and attempt < retries:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            sleep_s = max(float(retry_after), 0.25)
+                        except ValueError:
+                            sleep_s = 0.5 * attempt
+                    else:
+                        sleep_s = 0.5 * attempt
+                    time.sleep(sleep_s)
+                    continue
+
                 return response
             except requests.RequestException as e:
                 last_err = e
                 if attempt < retries:
                     time.sleep(0.5 * attempt)
+
         raise RuntimeError(f"Alpaca {method} {path} failed after {retries} attempts: {last_err}")
 
     def get_account(self) -> dict:

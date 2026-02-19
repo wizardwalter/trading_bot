@@ -79,7 +79,7 @@ def _symbol_profile(symbol: str) -> dict:
         return {
             "interval": "1m",
             "period": "2d",
-            "entry_threshold": 0.10,  # aggressive scalp profile for faster entries/exits
+            "entry_threshold": 0.14,  # tighter BTC threshold to reduce churn in noisy microstructure
         }
     # default day-trading profile for equities
     return {
