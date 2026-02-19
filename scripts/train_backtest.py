@@ -261,14 +261,26 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
             prev = end
 
         fold_scores = [_score_metrics(m) for m in fold_metrics]
-        cv_score = float(np.mean(fold_scores)) if fold_scores else -1.0
+        if fold_scores:
+            # Slightly overweight more recent folds to better match OOS deployment conditions.
+            base_weights = np.array([1.0, 1.2, 1.5, 1.8], dtype=float)
+            w = base_weights[-len(fold_scores) :]
+            cv_score = float(np.average(fold_scores, weights=w))
+        else:
+            cv_score = -1.0
 
         # Prefer thresholds that are consistent across folds, not just high average.
         if fold_metrics:
             ret_std = float(np.std([m.total_return for m in fold_metrics]))
             worst_fold_return = float(min(m.total_return for m in fold_metrics))
             worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
-            stability_penalty = (ret_std * 1.8) + (abs(min(worst_fold_return, 0.0)) * 0.7) + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
+            recent_fold_return = float(fold_metrics[-1].total_return)
+            stability_penalty = (
+                (ret_std * 1.8)
+                + (abs(min(worst_fold_return, 0.0)) * 0.7)
+                + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
+                + (abs(min(recent_fold_return, 0.0)) * 0.6)
+            )
         else:
             stability_penalty = 0.45
 
