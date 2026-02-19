@@ -92,8 +92,9 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
     sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
 
-    overbought = rsi > 74
-    oversold = rsi < 28
+    # Slightly earlier overbought filtering and deeper oversold allowance improved OOS behavior.
+    overbought = rsi > 70
+    oversold = rsi < 22
 
     bullish_confirmation = (trend > -0.01) & (m20 > -0.05)
     bearish_confirmation = (trend < 0.01) & (m20 < 0.05)
@@ -120,14 +121,14 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         elif state == 1:
             if long_exit[i]:
                 state = 0
-                cooldown = 1
+                cooldown = 0
             elif short_entry[i]:
                 state = -1
                 cooldown = 0
         elif state == -1:
             if short_exit[i]:
                 state = 0
-                cooldown = 1
+                cooldown = 0
             elif long_entry[i]:
                 state = 1
                 cooldown = 0
