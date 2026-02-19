@@ -193,40 +193,31 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     candidates = np.arange(0.10, 0.71, 0.01)
     scored = [simulate(train_df, th) for th in candidates]
 
-    def rank(metrics: list[Metrics]) -> list[Metrics]:
-        ordered = list(metrics)
-        ordered.sort(
+    # Primary objective: active thresholds that are at least near break-even on train.
+    active = [m for m in scored if m.trades >= 5 and m.total_return >= -0.005 and m.max_drawdown >= -0.12]
+    if active:
+        active.sort(
             key=lambda m: (
                 m.total_return,
                 m.sharpe_like,
-                m.expectancy * 1000,
+                m.expectancy,
                 m.max_drawdown,
-                m.trades,
+                -m.threshold,
             ),
             reverse=True,
         )
-        return ordered
-
-    # Primary objective: sufficiently active strategy that performs on train.
-    active = rank([m for m in scored if m.trades >= 5])
-    if active and active[0].total_return > -0.005:
         return active[0]
 
-    # Secondary fallback: keep some activity for signal discovery if drawdown is bounded.
-    semi_active = rank([m for m in scored if m.trades >= 2 and m.max_drawdown >= -0.10])
-    if semi_active:
-        return semi_active[0]
-
-    # Final capital-preservation fallback (can be no-trade only if everything else is poor).
-    defensive = list(scored)
-    defensive.sort(
+    # Defensive mode: when all active setups are losing, explicitly preserve capital.
+    # Prefer thresholds with the smallest drawdown/loss, then fewer trades, then stricter threshold.
+    defensive = sorted(
+        scored,
         key=lambda m: (
-            m.total_return,
-            m.max_drawdown,
+            abs(min(0.0, m.max_drawdown)),
+            abs(min(0.0, m.total_return)),
             m.trades,
             -m.threshold,
         ),
-        reverse=True,
     )
     return defensive[0]
 
