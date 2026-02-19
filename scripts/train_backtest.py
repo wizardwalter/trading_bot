@@ -194,23 +194,24 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     candidates = np.arange(0.10, 0.71, 0.01)
     scored = [simulate(train_df, th) for th in candidates]
 
-    # Primary objective: active thresholds that are at least near break-even on train.
-    active = [m for m in scored if m.trades >= 5 and m.total_return >= -0.005 and m.max_drawdown >= -0.12]
+    active = [m for m in scored if m.trades >= 6 and m.max_drawdown >= -0.12]
     if active:
-        active.sort(
+        best_ret = max(m.total_return for m in active)
+
+        # Keep thresholds that are close to the best train return, then bias to stricter
+        # thresholds to reduce overtrading and improve OOS robustness.
+        near_best = [m for m in active if m.total_return >= best_ret - 0.02]
+        near_best.sort(
             key=lambda m: (
-                m.total_return,
-                m.sharpe_like,
-                m.expectancy,
+                m.threshold,
                 m.max_drawdown,
-                -m.threshold,
+                m.expectancy,
+                m.total_return,
             ),
             reverse=True,
         )
-        return active[0]
+        return near_best[0]
 
-    # Defensive mode: when all active setups are losing, explicitly preserve capital.
-    # Prefer thresholds with the smallest drawdown/loss, then fewer trades, then stricter threshold.
     defensive = sorted(
         scored,
         key=lambda m: (
