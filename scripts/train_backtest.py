@@ -95,11 +95,11 @@ def _signals_long_only(df: pd.DataFrame, threshold: float) -> np.ndarray:
     bearish_confirmation = (trend < -0.03) & (m3 < 0.0)
     risk_off_regime = ((trend < -0.06) & (m20 < -0.08)) | (vol > 0.02)
 
-    oversold_rebound = (rsi < 30) & (m3 > (m20 + 0.10))
-    extreme_oversold_reversal = (rsi < 27) & (m3 > -0.15)
     overbought_exhaustion = (rsi > 78) & (m3 > 0.10)
 
-    want_buy = (score > buy_threshold) | oversold_rebound | extreme_oversold_reversal
+    # Trend-following bias: avoid catching falling knives in persistent downtrends.
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05)
+    want_buy = (score > buy_threshold) & bullish_confirmation
     want_buy = want_buy & (~overbought_exhaustion) & (~risk_off_regime)
 
     want_sell = overbought_exit | ((score < sell_threshold) & bearish_confirmation) | risk_off_regime
@@ -120,7 +120,7 @@ def _signals_long_only(df: pd.DataFrame, threshold: float) -> np.ndarray:
             if want_sell[i]:
                 signal[i] = -1
                 in_pos = False
-                cooldown = 2  # avoid immediate churn in noisy bars
+                cooldown = 3  # avoid immediate churn in noisy bars
 
     return signal
 
@@ -190,11 +190,14 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
-    candidates = np.arange(0.06, 0.26, 0.01)
+    candidates = np.arange(0.10, 0.71, 0.01)
     scored = [simulate(train_df, th) for th in candidates]
 
-    # Objective: prioritize robust equity growth, then risk-adjusted return, then drawdown control.
-    scored.sort(
+    # Avoid degenerate no-trade settings while still preferring higher return and lower drawdown.
+    active = [m for m in scored if m.trades >= 5]
+    pool = active if active else scored
+
+    pool.sort(
         key=lambda m: (
             m.total_return,
             m.sharpe_like,
@@ -204,7 +207,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
         ),
         reverse=True,
     )
-    return scored[0]
+    return pool[0]
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
@@ -237,10 +240,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(f"\nSaved: {out_file}")
 
     send_training_update(
-        "Backtest iteration complete | "
-        f"symbol={symbol} {interval} {period} | "
-        f"train_ret={best.total_return:.2%}, test_ret={test.total_return:.2%}, "
-        f"test_wr={test.win_rate:.1%}, maxDD={test.max_drawdown:.2%}, thr={best.threshold:.2f}"
+        f"{symbol} {interval} {period} | "
+        f"train return {best.total_return:.2%}, "
+        f"test return {test.total_return:.2%}, "
+        f"test win rate {test.win_rate:.1%}, "
+        f"test max drawdown {test.max_drawdown:.2%}, "
+        f"threshold {best.threshold:.2f}"
     )
 
 
