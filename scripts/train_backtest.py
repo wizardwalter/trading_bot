@@ -167,11 +167,42 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
     eq = (1 + pd.Series(strat)).cumprod()
     total_return = float(eq.iloc[-1] - 1)
 
-    trade_mask = turns > 0
-    trade_rets = pd.Series(strat)[trade_mask]
-    trades = int((turns > 0).sum())
-    win_rate = float((trade_rets > 0).mean()) if len(trade_rets) else 0.0
-    expectancy = float(trade_rets.mean()) if len(trade_rets) else 0.0
+    # Compute trade-level PnL over contiguous non-zero position regimes.
+    trade_rets: list[float] = []
+    active = False
+    active_side = 0.0
+    acc = 0.0
+    for i in range(len(position)):
+        side = position[i]
+        r = float(strat[i])
+
+        if not active and side != 0:
+            active = True
+            active_side = side
+            acc = r
+            continue
+
+        if active:
+            if side == 0:
+                acc += r
+                trade_rets.append(acc)
+                active = False
+                active_side = 0.0
+                acc = 0.0
+            elif side != active_side:
+                # Side flip: close prior trade and start the new one on the same bar.
+                trade_rets.append(acc)
+                active_side = side
+                acc = r
+            else:
+                acc += r
+
+    if active:
+        trade_rets.append(acc)
+
+    trades = len(trade_rets)
+    win_rate = float(np.mean(np.array(trade_rets) > 0)) if trades else 0.0
+    expectancy = float(np.mean(trade_rets)) if trades else 0.0
 
     vol = float(pd.Series(strat).std())
     sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(252 * 24 * 12)) if vol > 0 else 0.0
@@ -195,9 +226,11 @@ def _score_metrics(m: Metrics) -> float:
     return (
         (m.total_return * 2.8)
         + (m.sharpe_like * 0.045)
+        + (m.win_rate * 0.20)
         + (m.max_drawdown * 0.30)
         - (0.25 if m.trades < 6 else 0.0)
         - (0.15 if m.max_drawdown < -0.12 else 0.0)
+        - (0.08 if (m.expectancy < 0 and m.win_rate < 0.30) else 0.0)
     )
 
 
