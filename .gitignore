@@ -4,3 +4,4 @@ __pycache__/
 POSTGRES.md
 /logs
 data/backtests/*.json
+data/backups/
