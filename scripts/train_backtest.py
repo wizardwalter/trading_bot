@@ -191,55 +191,79 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
-    candidates = np.arange(0.10, 0.71, 0.01)
-    scored = [simulate(train_df, th) for th in candidates]
+    candidates = np.arange(0.05, 0.71, 0.01)
 
-    active = [m for m in scored if m.trades >= 6 and m.max_drawdown >= -0.12]
-    positive = [m for m in active if m.total_return > 0 and m.expectancy >= 0]
+    # Use a simple internal walk-forward split so threshold tuning is less likely
+    # to overfit to the earliest segment of the train window.
+    inner_split = int(len(train_df) * 0.7)
+    inner_split = max(120, min(len(train_df) - 80, inner_split))
+    fit_df = train_df.iloc[:inner_split]
+    val_df = train_df.iloc[inner_split:]
 
-    if positive:
-        # Optimize for robustness, not just peak return.
+    if len(fit_df) < 80 or len(val_df) < 40:
+        scored = [simulate(train_df, th) for th in candidates]
         return max(
-            positive,
+            scored,
             key=lambda m: (
                 m.total_return,
-                m.expectancy,
-                m.sharpe_like,
                 m.max_drawdown,
-                -m.trades,
-                m.threshold,
-            ),
-        )
-
-    defensive_all = min(
-        scored,
-        key=lambda m: (
-            abs(min(0.0, m.total_return)),
-            abs(min(0.0, m.max_drawdown)),
-            m.trades,
-            -m.threshold,
-        ),
-    )
-
-    if active:
-        # If no profitable candidate exists, prefer low-drawdown / low-turnover settings.
-        defensive_active = min(
-            active,
-            key=lambda m: (
-                abs(min(0.0, m.total_return)),
-                abs(min(0.0, m.max_drawdown)),
-                m.trades,
+                m.sharpe_like,
+                -abs(m.trades - 30),
                 -m.threshold,
             ),
         )
-        # Strongly negative in-sample regimes should default to the global defensive
-        # setting, even if that means standing aside with very low turnover.
-        if defensive_active.total_return <= -0.005:
-            return defensive_all
-        return defensive_active
 
-    # Absolute fallback: choose the most defensive threshold among all candidates.
-    return defensive_all
+    ranked: list[tuple[float, Metrics, Metrics]] = []
+    for th in candidates:
+        fit = simulate(fit_df, th)
+        val = simulate(val_df, th)
+
+        # Score favors validation robustness, while penalizing deep drawdowns and
+        # strongly negative fit behavior.
+        score = (
+            (val.total_return * 2.8)
+            + (val.expectancy * 180.0)
+            + (val.sharpe_like * 0.06)
+            + (val.max_drawdown * 0.22)
+            - (0.55 if fit.max_drawdown < -0.18 else 0.0)
+            - (0.45 if fit.total_return < -0.06 else 0.0)
+            - (0.20 if val.trades < 4 else 0.0)
+        )
+        ranked.append((score, fit, val))
+
+    # Prefer active-but-defensive settings when available.
+    viable = [
+        (score, fit, val)
+        for score, fit, val in ranked
+        if val.max_drawdown >= -0.10 and fit.max_drawdown >= -0.15
+    ]
+
+    if viable:
+        chosen = max(
+            viable,
+            key=lambda x: (
+                x[0],
+                x[2].total_return,
+                x[2].expectancy,
+                x[2].sharpe_like,
+                -abs(x[2].trades - 24),
+                -x[2].threshold,
+            ),
+        )
+        return simulate(train_df, chosen[2].threshold)
+
+    # Fallback: most defensive threshold over the full training slice.
+    scored = [simulate(train_df, th) for th in candidates]
+    return max(
+        scored,
+        key=lambda m: (
+            m.total_return,
+            m.max_drawdown,
+            m.sharpe_like,
+            -abs(m.trades - 20),
+            -m.threshold,
+        ),
+    )
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
