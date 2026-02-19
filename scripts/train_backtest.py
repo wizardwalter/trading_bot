@@ -80,7 +80,7 @@ class Metrics:
     max_drawdown: float
 
 
-def _signals_long_only(df: pd.DataFrame, threshold: float) -> np.ndarray:
+def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     score = df["score"].values
     rsi = df["rsi"].values
     m3 = df["m3"].values
@@ -91,38 +91,49 @@ def _signals_long_only(df: pd.DataFrame, threshold: float) -> np.ndarray:
     buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
     sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
 
-    overbought_exit = (rsi > 74) & (m3 < 0.08)
-    bearish_confirmation = (trend < -0.03) & (m3 < 0.0)
-    risk_off_regime = ((trend < -0.06) & (m20 < -0.08)) | (vol > 0.02)
+    overbought = rsi > 74
+    oversold = rsi < 28
 
-    overbought_exhaustion = (rsi > 78) & (m3 > 0.10)
-
-    # Trend-following bias: avoid catching falling knives in persistent downtrends.
     bullish_confirmation = (trend > -0.01) & (m20 > -0.05)
-    want_buy = (score > buy_threshold) & bullish_confirmation
-    want_buy = want_buy & (~overbought_exhaustion) & (~risk_off_regime)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05)
 
-    want_sell = overbought_exit | ((score < sell_threshold) & bearish_confirmation) | risk_off_regime
+    long_entry = (score > buy_threshold) & bullish_confirmation & (~overbought)
+    short_entry = (score < sell_threshold) & bearish_confirmation & (~oversold)
 
-    signal = np.zeros(len(df), dtype=np.int8)
-    in_pos = False
+    long_exit = (score < -0.05) | (overbought & (m3 < 0.06))
+    short_exit = (score > 0.05) | (oversold & (m3 > -0.06))
+
+    position = np.zeros(len(df), dtype=np.int8)
+    state = 0
     cooldown = 0
 
     for i in range(len(df)):
         if cooldown > 0:
             cooldown -= 1
 
-        if not in_pos:
-            if cooldown == 0 and want_buy[i]:
-                signal[i] = 1
-                in_pos = True
-        else:
-            if want_sell[i]:
-                signal[i] = -1
-                in_pos = False
-                cooldown = 3  # avoid immediate churn in noisy bars
+        if state == 0:
+            if cooldown == 0 and long_entry[i]:
+                state = 1
+            elif cooldown == 0 and short_entry[i]:
+                state = -1
+        elif state == 1:
+            if long_exit[i]:
+                state = 0
+                cooldown = 2
+            elif short_entry[i]:
+                state = -1
+                cooldown = 1
+        elif state == -1:
+            if short_exit[i]:
+                state = 0
+                cooldown = 2
+            elif long_entry[i]:
+                state = 1
+                cooldown = 1
 
-    return signal
+        position[i] = state
+
+    return position
 
 
 def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_bps: float = 2.0) -> Metrics:
@@ -140,17 +151,7 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
     fee = fee_bps / 10_000
     slippage = slippage_bps / 10_000
 
-    signal = _signals_long_only(df, threshold)
-
-    # Convert event signal (buy/sell actions) to position state.
-    position = np.zeros(len(signal), dtype=float)
-    in_pos = 0.0
-    for i, sig in enumerate(signal):
-        if sig == 1:
-            in_pos = 1.0
-        elif sig == -1:
-            in_pos = 0.0
-        position[i] = in_pos
+    position = _target_position(df, threshold).astype(float)
 
     # Position applies from the next bar onward.
     position = pd.Series(position).shift(1).fillna(0).values
@@ -167,7 +168,7 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
     trade_mask = turns > 0
     trade_rets = pd.Series(strat)[trade_mask]
-    trades = int((signal == 1).sum())
+    trades = int((turns > 0).sum())
     win_rate = float((trade_rets > 0).mean()) if len(trade_rets) else 0.0
     expectancy = float(trade_rets.mean()) if len(trade_rets) else 0.0
 
@@ -213,9 +214,10 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     defensive = sorted(
         scored,
         key=lambda m: (
+            m.trades == 0,
             abs(min(0.0, m.max_drawdown)),
             abs(min(0.0, m.total_return)),
-            m.trades,
+            -m.trades,
             -m.threshold,
         ),
     )
