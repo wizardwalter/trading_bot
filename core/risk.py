@@ -5,6 +5,7 @@ import os
 MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "0.0075"))
 MAX_DAILY_DRAWDOWN = float(os.getenv("MAX_DAILY_DRAWDOWN", "0.03"))
 MAX_PORTFOLIO_EXPOSURE = float(os.getenv("MAX_PORTFOLIO_EXPOSURE", "0.35"))
+POSITION_FRACTION = float(os.getenv("POSITION_FRACTION", "0.10"))
 
 
 def drawdown_exceeded(day_start_equity: float, current_equity: float) -> bool:

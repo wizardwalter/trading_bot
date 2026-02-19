@@ -5,7 +5,13 @@ from datetime import datetime
 from typing import Dict
 
 from core.market_hours import is_trade_window_open
-from core.risk import MAX_RISK_PER_TRADE, POSITION_FRACTION, drawdown_exceeded, exceeds_portfolio_exposure
+from core.risk import (
+    MAX_PORTFOLIO_EXPOSURE,
+    MAX_RISK_PER_TRADE,
+    POSITION_FRACTION,
+    drawdown_exceeded,
+    exceeds_portfolio_exposure,
+)
 from core.strategy import position_size, should_enter_trade
 from data.database import get_all_tickers, log_trade
 from discord.notify import send_trade_alert
@@ -81,6 +87,26 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             if action == "buy":
                 positions = broker.get_positions()
                 current_exposure = sum(max(float(p.get("market_value", 0.0)), 0.0) for p in positions)
+
+                # Hard-cap aggregate long exposure and downsize qty to fit remaining room.
+                max_allowed_exposure = max(current_equity * MAX_PORTFOLIO_EXPOSURE, 0.0)
+                remaining_exposure = max(max_allowed_exposure - current_exposure, 0.0)
+                qty_exposure = int(remaining_exposure / max(float(decision["price"]), 0.01))
+
+                if qty_exposure <= 0:
+                    print(
+                        f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                        f"(exposure cap) | current={current_exposure:.2f} max={max_allowed_exposure:.2f}"
+                    )
+                    continue
+
+                if qty_exposure < qty:
+                    print(
+                        f"[{datetime.utcnow().isoformat()}] ⚖️ Downsize BUY {ticker} qty {qty}->{qty_exposure} "
+                        f"to respect exposure cap"
+                    )
+                    qty = max(qty_exposure, 1)
+
                 trade_notional = float(decision["price"]) * max(int(qty), 0)
                 if exceeds_portfolio_exposure(
                     current_exposure=current_exposure,

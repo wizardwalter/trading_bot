@@ -45,6 +45,10 @@ class AlpacaBroker:
         r.raise_for_status()
         return r.json()
 
+    def get_buying_power(self) -> float:
+        acct = self.get_account()
+        return float(acct.get("buying_power") or acct.get("equity") or 0.0)
+
     def get_position_qty(self, symbol: str) -> float:
         symbol = _to_alpaca_symbol(symbol)
         try:
