@@ -21,6 +21,7 @@ from services.alpaca_broker import AlpacaBroker
 MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.12"))
 MAX_SYMBOL_EXPOSURE = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0.18"))
 MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "25"))
+MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "250"))
 CRYPTO_QTY_PRECISION = int(os.getenv("CRYPTO_QTY_PRECISION", "6"))
 
 
@@ -114,29 +115,34 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 symbol_position = next((p for p in positions if p.get("symbol", "").upper() == ticker.replace("-", "").upper()), None)
                 current_symbol_exposure = max(float(symbol_position.get("market_value", 0.0)), 0.0) if symbol_position else 0.0
 
-                # Hard-cap aggregate long exposure and downsize qty to fit remaining room.
+                # Compute all notional caps first, then derive qty from bounded notional.
                 max_allowed_exposure = max(current_equity * MAX_PORTFOLIO_EXPOSURE, 0.0)
                 remaining_exposure = max(max_allowed_exposure - current_exposure, 0.0)
-                qty_exposure = _normalize_qty(
-                    ticker,
-                    remaining_exposure / max(float(decision["price"]), 0.01),
-                )
 
-                # Cap concentration per symbol as an additional stability guard.
                 max_symbol_exposure = max(current_equity * MAX_SYMBOL_EXPOSURE, 0.0)
                 remaining_symbol_exposure = max(max_symbol_exposure - current_symbol_exposure, 0.0)
-                qty_symbol_cap = _normalize_qty(
-                    ticker,
-                    remaining_symbol_exposure / max(float(decision["price"]), 0.01),
+
+                max_bp_notional = max(buying_power - MIN_CASH_BUFFER, 0.0) * POSITION_FRACTION
+                risk_notional = float(qty) * float(decision["price"])
+
+                allowed_notional = min(
+                    remaining_exposure,
+                    remaining_symbol_exposure,
+                    max_bp_notional,
+                    risk_notional,
                 )
 
-                qty = _normalize_qty(ticker, min(qty, qty_exposure, qty_symbol_cap))
+                qty = _normalize_qty(
+                    ticker,
+                    allowed_notional / max(float(decision["price"]), 0.01),
+                )
 
                 if qty <= 0:
                     print(
                         f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
-                        f"(exposure/symbol cap) | portfolio={current_exposure:.2f}/{max_allowed_exposure:.2f} "
-                        f"symbol={current_symbol_exposure:.2f}/{max_symbol_exposure:.2f}"
+                        f"(cap/no room) | portfolio={current_exposure:.2f}/{max_allowed_exposure:.2f} "
+                        f"symbol={current_symbol_exposure:.2f}/{max_symbol_exposure:.2f} "
+                        f"bp_room={max_bp_notional:.2f}"
                     )
                     continue
 

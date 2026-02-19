@@ -140,9 +140,11 @@ def build_signal(symbol: str) -> Signal:
     # once short-term momentum stops accelerating higher.
     overbought_exit = rsi > 74 and short_momentum_component < 0.08
 
+    bearish_confirmation = (trend_component < -0.03 and short_momentum_component < 0.0)
+
     if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion:
         action = "buy"
-    elif score < sell_threshold or overbought_exit:
+    elif overbought_exit or (score < sell_threshold and bearish_confirmation):
         action = "sell"
     else:
         action = "hold"
