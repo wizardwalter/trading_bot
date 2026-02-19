@@ -232,7 +232,8 @@ def _score_metrics(m: Metrics) -> float:
         + (m.sharpe_like * 0.045)
         + (m.win_rate * 0.20)
         + (m.max_drawdown * 0.30)
-        - (0.25 if m.trades < 6 else 0.0)
+        # Allow slightly lower trade counts to avoid over-penalizing high-conviction regimes.
+        - (0.15 if m.trades < 6 else 0.0)
         - (0.15 if m.max_drawdown < -0.12 else 0.0)
         - (0.08 if (m.expectancy < 0 and m.win_rate < 0.30) else 0.0)
     )
@@ -275,10 +276,11 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
         scored.append((score, full_m))
 
     # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
+    # A 5-trade floor keeps the strategy active while allowing higher-quality selective entries.
     viable = [
         (score, m)
         for score, m in scored
-        if m.total_return > 0 and m.max_drawdown >= -0.12 and m.trades >= 6
+        if m.total_return > 0 and m.max_drawdown >= -0.12 and m.trades >= 5
     ]
 
     if viable:
