@@ -240,25 +240,35 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
 
     # Walk-forward validation within the training window to reduce threshold overfitting.
     n = len(train_df)
-    fold_start = int(n * 0.35)
-    fold_ends = [int(n * 0.60), int(n * 0.80), n]
+    fold_start = int(n * 0.30)
+    fold_ends = [int(n * 0.50), int(n * 0.65), int(n * 0.80), n]
 
     scored: list[tuple[float, Metrics]] = []
     for th in candidates:
         full_m = simulate(train_df, th)
 
-        fold_scores: list[float] = []
+        fold_metrics: list[Metrics] = []
         prev = fold_start
         for end in fold_ends:
             fold = train_df.iloc[prev:end]
             if len(fold) < 200:
                 continue
-            fold_m = simulate(fold, th)
-            fold_scores.append(_score_metrics(fold_m))
+            fold_metrics.append(simulate(fold, th))
             prev = end
 
+        fold_scores = [_score_metrics(m) for m in fold_metrics]
         cv_score = float(np.mean(fold_scores)) if fold_scores else -1.0
-        score = (_score_metrics(full_m) * 0.45) + (cv_score * 0.55)
+
+        # Prefer thresholds that are consistent across folds, not just high average.
+        if fold_metrics:
+            ret_std = float(np.std([m.total_return for m in fold_metrics]))
+            worst_fold_return = float(min(m.total_return for m in fold_metrics))
+            worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
+            stability_penalty = (ret_std * 1.8) + (abs(min(worst_fold_return, 0.0)) * 0.7) + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
+        else:
+            stability_penalty = 0.45
+
+        score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty
         scored.append((score, full_m))
 
     # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
