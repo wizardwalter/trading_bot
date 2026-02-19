@@ -271,8 +271,10 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(json.dumps(result, indent=2))
     print(f"\nSaved: {out_file}")
 
+    mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
     webhook_msg = (
-        f"{symbol} {interval} {period} | "
+        f"{symbol} {interval} {period} | mode={mode} | "
+        f"thr={best.threshold:.2f} | train trades={best.trades}, test trades={test.trades} | "
         f"train return {best.total_return:.2%}, "
         f"test return {test.total_return:.2%}, "
         f"test win rate {test.win_rate:.1%}, "
