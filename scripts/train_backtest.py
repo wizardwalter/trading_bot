@@ -191,20 +191,41 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
     )
 
 
+def _score_metrics(m: Metrics) -> float:
+    return (
+        (m.total_return * 2.8)
+        + (m.sharpe_like * 0.045)
+        + (m.max_drawdown * 0.30)
+        - (0.25 if m.trades < 6 else 0.0)
+        - (0.15 if m.max_drawdown < -0.12 else 0.0)
+    )
+
+
 def pick_best(train_df: pd.DataFrame) -> Metrics:
     candidates = np.arange(0.05, 0.71, 0.01)
 
+    # Walk-forward validation within the training window to reduce threshold overfitting.
+    n = len(train_df)
+    fold_start = int(n * 0.35)
+    fold_ends = [int(n * 0.60), int(n * 0.80), n]
+
     scored: list[tuple[float, Metrics]] = []
     for th in candidates:
-        m = simulate(train_df, th)
-        score = (
-            (m.total_return * 3.0)
-            + (m.sharpe_like * 0.05)
-            + (m.max_drawdown * 0.20)
-            - (0.25 if m.trades < 6 else 0.0)
-            - (0.15 if m.max_drawdown < -0.12 else 0.0)
-        )
-        scored.append((score, m))
+        full_m = simulate(train_df, th)
+
+        fold_scores: list[float] = []
+        prev = fold_start
+        for end in fold_ends:
+            fold = train_df.iloc[prev:end]
+            if len(fold) < 200:
+                continue
+            fold_m = simulate(fold, th)
+            fold_scores.append(_score_metrics(fold_m))
+            prev = end
+
+        cv_score = float(np.mean(fold_scores)) if fold_scores else -1.0
+        score = (_score_metrics(full_m) * 0.45) + (cv_score * 0.55)
+        scored.append((score, full_m))
 
     # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
     viable = [
