@@ -24,6 +24,8 @@ def get_connection():
 
 
 def log_trade(ticker, action, price, quantity, signal_strength=0.0, reason=""):
+    qty = float(quantity)
+
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -32,11 +34,24 @@ def log_trade(ticker, action, price, quantity, signal_strength=0.0, reason=""):
                     INSERT INTO trades (ticker, action, price, quantity, signal_strength, reason, timestamp)
                     VALUES (%s, %s, %s, %s, %s, %s, NOW())
                     """,
-                    (ticker, action, float(price), int(quantity), float(signal_strength), reason),
+                    (ticker, action, float(price), qty, float(signal_strength), reason),
                 )
     except Exception:
-        # DB optional during early bring-up; trading loop should still run.
-        return
+        # Backward-compatibility for older schemas where quantity is INTEGER.
+        # Preserve non-zero intent instead of truncating tiny crypto fills to 0.
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO trades (ticker, action, price, quantity, signal_strength, reason, timestamp)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        """,
+                        (ticker, action, float(price), int(round(qty)), float(signal_strength), reason),
+                    )
+        except Exception:
+            # DB optional during early bring-up; trading loop should still run.
+            return
 
 
 def get_position_qty(ticker: str) -> int:

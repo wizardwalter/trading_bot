@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS trades (
     ticker VARCHAR(10) REFERENCES tickers(symbol),
     action VARCHAR(10),  -- buy or sell
     price DECIMAL(10, 2),
-    quantity INTEGER,
+    quantity NUMERIC(18, 8),
     signal_strength FLOAT,
     reason TEXT,
     timestamp TIMESTAMPTZ DEFAULT NOW()
