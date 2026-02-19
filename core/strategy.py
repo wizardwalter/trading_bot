@@ -128,10 +128,15 @@ def build_signal(symbol: str) -> Signal:
     buy_threshold = base_threshold + vol_penalty
     sell_threshold = -base_threshold - vol_penalty
 
-    # Oversold rebound bias only triggers when very short-term momentum improves.
+    # Oversold rebound bias: let BTC enter a little earlier on deep pullbacks
+    # when momentum is no longer strongly deteriorating.
     oversold_rebound = (rsi < 30 and short_momentum_component > momentum_component + 0.10)
+    extreme_oversold_reversal = (rsi < 27 and short_momentum_component > -0.15)
 
-    if score > buy_threshold or oversold_rebound:
+    # Avoid fresh long entries during euphoric spikes.
+    overbought_exhaustion = rsi > 78 and short_momentum_component > 0.10
+
+    if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion:
         action = "buy"
     elif score < sell_threshold or rsi > 74:
         action = "sell"
@@ -139,7 +144,7 @@ def build_signal(symbol: str) -> Signal:
         action = "hold"
 
     # Suppress low-conviction churn around neutral conditions.
-    if abs(score) < 0.06 and not oversold_rebound:
+    if abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
         action = "hold"
 
     confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)

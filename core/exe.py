@@ -19,6 +19,8 @@ from services.alpaca_broker import AlpacaBroker
 
 
 MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.12"))
+MAX_SYMBOL_EXPOSURE = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0.18"))
+MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "25"))
 
 
 def run_bot(paper_mode: bool = True, execute_orders: bool = False):
@@ -82,32 +84,44 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 continue
 
             if action == "sell":
-                qty = min(qty, int(current_qty))
+                # Exit the full position on sell signal; avoids partial dribble exits.
+                qty = int(current_qty)
 
             if action == "buy":
                 positions = broker.get_positions()
                 current_exposure = sum(max(float(p.get("market_value", 0.0)), 0.0) for p in positions)
+
+                symbol_position = next((p for p in positions if p.get("symbol", "").upper() == ticker.replace("-", "").upper()), None)
+                current_symbol_exposure = max(float(symbol_position.get("market_value", 0.0)), 0.0) if symbol_position else 0.0
 
                 # Hard-cap aggregate long exposure and downsize qty to fit remaining room.
                 max_allowed_exposure = max(current_equity * MAX_PORTFOLIO_EXPOSURE, 0.0)
                 remaining_exposure = max(max_allowed_exposure - current_exposure, 0.0)
                 qty_exposure = int(remaining_exposure / max(float(decision["price"]), 0.01))
 
-                if qty_exposure <= 0:
+                # Cap concentration per symbol as an additional stability guard.
+                max_symbol_exposure = max(current_equity * MAX_SYMBOL_EXPOSURE, 0.0)
+                remaining_symbol_exposure = max(max_symbol_exposure - current_symbol_exposure, 0.0)
+                qty_symbol_cap = int(remaining_symbol_exposure / max(float(decision["price"]), 0.01))
+
+                qty = min(qty, qty_exposure, qty_symbol_cap)
+
+                if qty <= 0:
                     print(
                         f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
-                        f"(exposure cap) | current={current_exposure:.2f} max={max_allowed_exposure:.2f}"
+                        f"(exposure/symbol cap) | portfolio={current_exposure:.2f}/{max_allowed_exposure:.2f} "
+                        f"symbol={current_symbol_exposure:.2f}/{max_symbol_exposure:.2f}"
                     )
                     continue
 
-                if qty_exposure < qty:
-                    print(
-                        f"[{datetime.utcnow().isoformat()}] ⚖️ Downsize BUY {ticker} qty {qty}->{qty_exposure} "
-                        f"to respect exposure cap"
-                    )
-                    qty = max(qty_exposure, 1)
-
                 trade_notional = float(decision["price"]) * max(int(qty), 0)
+                if trade_notional < MIN_ORDER_NOTIONAL:
+                    print(
+                        f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                        f"(min notional ${MIN_ORDER_NOTIONAL:.2f})"
+                    )
+                    continue
+
                 if exceeds_portfolio_exposure(
                     current_exposure=current_exposure,
                     trade_notional=trade_notional,
