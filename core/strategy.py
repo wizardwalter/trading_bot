@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict
 
 import pandas as pd
@@ -73,13 +76,40 @@ def _features(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna()
 
 
+def _load_backtest_threshold(symbol: str, fallback: float) -> float:
+    if os.getenv("USE_BACKTEST_THRESHOLD", "1") != "1":
+        return fallback
+
+    path = Path(os.getenv("BACKTEST_LATEST_PATH", "data/backtests/latest.json"))
+    if not path.exists():
+        return fallback
+
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return fallback
+
+    if str(payload.get("symbol", "")).upper() != symbol.upper():
+        return fallback
+
+    candidate = payload.get("test", {}).get("threshold")
+    if candidate is None:
+        candidate = payload.get("best_train", {}).get("threshold")
+    if candidate is None:
+        return fallback
+
+    # Keep thresholds in a sane range so stale/overfit backtests cannot brick execution.
+    return float(min(max(float(candidate), 0.08), 0.60))
+
+
 def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
+        base = 0.14  # tighter BTC threshold to reduce churn in noisy microstructure
         return {
             "interval": "1m",
             "period": "2d",
-            "entry_threshold": 0.14,  # tighter BTC threshold to reduce churn in noisy microstructure
+            "entry_threshold": _load_backtest_threshold(s, base),
         }
     # default day-trading profile for equities
     return {
