@@ -101,8 +101,8 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     long_entry = (score > buy_threshold) & bullish_confirmation & (~overbought)
     short_entry = (score < sell_threshold) & bearish_confirmation & (~oversold)
 
-    long_exit = (score < -0.05) | (overbought & (m3 < 0.06))
-    short_exit = (score > 0.05) | (oversold & (m3 > -0.06))
+    long_exit = (score < -0.02) | (overbought & (m3 < 0.08))
+    short_exit = (score > 0.02) | (oversold & (m3 > -0.08))
 
     position = np.zeros(len(df), dtype=np.int8)
     state = 0
