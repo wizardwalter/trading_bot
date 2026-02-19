@@ -43,6 +43,6 @@ def send_status_update(message: str):
     _send(f"📊 {message}")
 
 
-def send_training_update(message: str):
+def send_training_update(message: str) -> bool:
     # Prefer dedicated training channel; fallback to default webhook if unset.
-    _send_to(TRAINING_WEBHOOK_URL or DISCORD_WEBHOOK_URL, f"🧠 {message}")
+    return _send_to(TRAINING_WEBHOOK_URL or DISCORD_WEBHOOK_URL, f"🧠 {message}")

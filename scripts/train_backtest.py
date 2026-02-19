@@ -305,7 +305,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
         f"test max drawdown {test.max_drawdown:.2%}"
     )
     try:
-        send_training_update(webhook_msg)
+        delivered = send_training_update(webhook_msg)
+        if not delivered:
+            print("Webhook update failed: no webhook configured or delivery failed after retries")
     except Exception as e:
         # Never fail the training/backtest run just because the webhook endpoint is unavailable.
         print(f"Webhook update failed: {e}")
