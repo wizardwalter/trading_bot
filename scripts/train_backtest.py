@@ -61,8 +61,9 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     m20 = (out["ret_20"] * 25).clip(-1, 1)
     m3 = (out["ret_3"] * 35).clip(-1, 1)
 
-    rsi_comp = np.where(out["rsi"] < 35, 0.8, np.where(out["rsi"] > 68, -0.8, 0.0))
-    out["score"] = 0.44 * trend + 0.22 * m20 + 0.20 * m3 + 0.14 * rsi_comp
+    rsi_comp = np.where(out["rsi"] < 33, 0.8, np.where(out["rsi"] > 70, -0.8, 0.0))
+    # Heavier trend weighting + lighter short-momentum noise improves regime filtering.
+    out["score"] = 0.48 * trend + 0.22 * m20 + 0.10 * m3 + 0.20 * rsi_comp
     out["trend"] = trend
     out["m3"] = m3
     out["m20"] = m20
