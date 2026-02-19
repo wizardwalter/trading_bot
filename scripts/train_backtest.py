@@ -193,21 +193,38 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     candidates = np.arange(0.10, 0.71, 0.01)
     scored = [simulate(train_df, th) for th in candidates]
 
-    # Avoid degenerate no-trade settings while still preferring higher return and lower drawdown.
-    active = [m for m in scored if m.trades >= 5]
-    pool = active if active else scored
+    def rank(metrics: list[Metrics]) -> list[Metrics]:
+        ordered = list(metrics)
+        ordered.sort(
+            key=lambda m: (
+                m.total_return,
+                m.sharpe_like,
+                m.expectancy * 1000,
+                m.max_drawdown,
+                -m.trades,
+            ),
+            reverse=True,
+        )
+        return ordered
 
-    pool.sort(
+    # Primary objective: sufficiently active strategy that performs on train.
+    active = rank([m for m in scored if m.trades >= 5])
+    if active and active[0].total_return > -0.005:
+        return active[0]
+
+    # Regime-preservation fallback: if active setups all lose on train,
+    # allow defensive high-threshold/no-trade settings to protect capital.
+    defensive = list(scored)
+    defensive.sort(
         key=lambda m: (
             m.total_return,
-            m.sharpe_like,
-            m.expectancy * 1000,
             m.max_drawdown,
             -m.trades,
+            m.threshold,
         ),
         reverse=True,
     )
-    return pool[0]
+    return defensive[0]
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
