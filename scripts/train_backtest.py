@@ -251,14 +251,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(json.dumps(result, indent=2))
     print(f"\nSaved: {out_file}")
 
-    send_training_update(
+    webhook_msg = (
         f"{symbol} {interval} {period} | "
         f"train return {best.total_return:.2%}, "
         f"test return {test.total_return:.2%}, "
         f"test win rate {test.win_rate:.1%}, "
-        f"test max drawdown {test.max_drawdown:.2%}, "
-        f"threshold {best.threshold:.2f}"
+        f"test max drawdown {test.max_drawdown:.2%}"
     )
+    try:
+        send_training_update(webhook_msg)
+    except Exception as e:
+        # Never fail the training/backtest run just because the webhook endpoint is unavailable.
+        print(f"Webhook update failed: {e}")
 
 
 if __name__ == "__main__":
