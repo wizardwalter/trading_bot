@@ -325,12 +325,13 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
 
     mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
     webhook_msg = (
-        f"{symbol} {interval} {period} {mode} "
-        f"train_return={best.total_return:.2%} "
-        f"test_return={test.total_return:.2%} "
-        f"test_win_rate={test.win_rate:.1%} "
+        f"{symbol} {interval} {period} {mode} | "
+        f"train_return={best.total_return:.2%} | "
+        f"test_return={test.total_return:.2%} | "
+        f"test_win_rate={test.win_rate:.1%} | "
         f"test_max_drawdown={test.max_drawdown:.2%}"
     )
+    print(f"Webhook metrics: {webhook_msg}")
     try:
         delivered = send_training_update(webhook_msg)
         if not delivered:
