@@ -14,11 +14,15 @@ TRAINING_WEBHOOK_URL = os.getenv("TRAINING_WEBHOOK_URL")
 
 def _send_to(url: str | None, content: str):
     if not url:
-        return
-    try:
-        requests.post(url, json={"content": content}, timeout=10)
-    except Exception:
-        pass
+        return False
+    for _ in range(3):
+        try:
+            r = requests.post(url, json={"content": content}, timeout=10)
+            if 200 <= r.status_code < 300:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _send(content: str):
