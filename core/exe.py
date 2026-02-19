@@ -50,6 +50,7 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
         return
 
     start_equity = float(account.get("equity", 0.0))
+    last_account_snapshot = account
 
     tickers = get_all_tickers()
     if not tickers:
@@ -66,9 +67,13 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
 
             try:
                 account_now = broker.get_account()
+                last_account_snapshot = account_now
             except Exception as e:
-                print(f"[{datetime.utcnow().isoformat()}] ⚠️ Account fetch failed for {ticker}: {e}")
-                continue
+                account_now = last_account_snapshot
+                print(
+                    f"[{datetime.utcnow().isoformat()}] ⚠️ Account fetch failed for {ticker}; "
+                    f"using stale snapshot: {e}"
+                )
 
             current_equity = float(account_now.get("equity", 0.0))
             if drawdown_exceeded(start_equity, current_equity):

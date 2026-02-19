@@ -201,7 +201,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
                 m.sharpe_like,
                 m.expectancy * 1000,
                 m.max_drawdown,
-                -m.trades,
+                m.trades,
             ),
             reverse=True,
         )
@@ -212,15 +212,19 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     if active and active[0].total_return > -0.005:
         return active[0]
 
-    # Regime-preservation fallback: if active setups all lose on train,
-    # allow defensive high-threshold/no-trade settings to protect capital.
+    # Secondary fallback: keep some activity for signal discovery if drawdown is bounded.
+    semi_active = rank([m for m in scored if m.trades >= 2 and m.max_drawdown >= -0.10])
+    if semi_active:
+        return semi_active[0]
+
+    # Final capital-preservation fallback (can be no-trade only if everything else is poor).
     defensive = list(scored)
     defensive.sort(
         key=lambda m: (
             m.total_return,
             m.max_drawdown,
-            -m.trades,
-            m.threshold,
+            m.trades,
+            -m.threshold,
         ),
         reverse=True,
     )
