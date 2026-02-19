@@ -195,34 +195,51 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     scored = [simulate(train_df, th) for th in candidates]
 
     active = [m for m in scored if m.trades >= 6 and m.max_drawdown >= -0.12]
-    if active:
-        best_ret = max(m.total_return for m in active)
+    positive = [m for m in active if m.total_return > 0 and m.expectancy >= 0]
 
-        # Keep thresholds that are close to the best train return, then bias to stricter
-        # thresholds to reduce overtrading and improve OOS robustness.
-        near_best = [m for m in active if m.total_return >= best_ret - 0.02]
-        near_best.sort(
+    if positive:
+        # Optimize for robustness, not just peak return.
+        return max(
+            positive,
             key=lambda m: (
-                m.threshold,
-                m.max_drawdown,
-                m.expectancy,
                 m.total_return,
+                m.expectancy,
+                m.sharpe_like,
+                m.max_drawdown,
+                -m.trades,
+                m.threshold,
             ),
-            reverse=True,
         )
-        return near_best[0]
 
-    defensive = sorted(
+    defensive_all = min(
         scored,
         key=lambda m: (
-            m.trades == 0,
-            abs(min(0.0, m.max_drawdown)),
             abs(min(0.0, m.total_return)),
-            -m.trades,
+            abs(min(0.0, m.max_drawdown)),
+            m.trades,
             -m.threshold,
         ),
     )
-    return defensive[0]
+
+    if active:
+        # If no profitable candidate exists, prefer low-drawdown / low-turnover settings.
+        defensive_active = min(
+            active,
+            key=lambda m: (
+                abs(min(0.0, m.total_return)),
+                abs(min(0.0, m.max_drawdown)),
+                m.trades,
+                -m.threshold,
+            ),
+        )
+        # Strongly negative in-sample regimes should default to the global defensive
+        # setting, even if that means standing aside with very low turnover.
+        if defensive_active.total_return <= -0.005:
+            return defensive_all
+        return defensive_active
+
+    # Absolute fallback: choose the most defensive threshold among all candidates.
+    return defensive_all
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):

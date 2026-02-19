@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import random
 import time
 
 import requests
@@ -35,33 +37,41 @@ class AlpacaBroker:
             }
         )
 
-    def _request(self, method: str, path: str, timeout: int = 15, retries: int = 4, **kwargs):
+    def _request(self, method: str, path: str, timeout: int | tuple[int, int] = 15, retries: int = 4, **kwargs):
         last_err: Exception | None = None
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
 
-        for attempt in range(1, retries + 1):
-            try:
-                response = self.session.request(method, f"{self.base_url}{path}", timeout=timeout, **kwargs)
+        # Allow env tuning without code changes.
+        connect_timeout = int(os.getenv("ALPACA_CONNECT_TIMEOUT", "8"))
+        read_timeout = int(os.getenv("ALPACA_READ_TIMEOUT", "20"))
+        request_timeout = timeout if isinstance(timeout, tuple) else (connect_timeout, read_timeout)
+        total_retries = max(int(os.getenv("ALPACA_REQUEST_RETRIES", str(retries))), 1)
 
-                if response.status_code in retryable_statuses and attempt < retries:
+        for attempt in range(1, total_retries + 1):
+            try:
+                response = self.session.request(method, f"{self.base_url}{path}", timeout=request_timeout, **kwargs)
+
+                if response.status_code in retryable_statuses and attempt < total_retries:
                     retry_after = response.headers.get("Retry-After")
                     if retry_after is not None:
                         try:
                             sleep_s = max(float(retry_after), 0.25)
                         except ValueError:
-                            sleep_s = 0.5 * attempt
+                            sleep_s = min(0.6 * (2 ** (attempt - 1)), 6.0)
                     else:
-                        sleep_s = 0.5 * attempt
+                        sleep_s = min(0.6 * (2 ** (attempt - 1)), 6.0)
+                    sleep_s += random.uniform(0.0, 0.2)
                     time.sleep(sleep_s)
                     continue
 
                 return response
             except requests.RequestException as e:
                 last_err = e
-                if attempt < retries:
-                    time.sleep(0.5 * attempt)
+                if attempt < total_retries:
+                    sleep_s = min(0.6 * (2 ** (attempt - 1)), 6.0) + random.uniform(0.0, 0.2)
+                    time.sleep(sleep_s)
 
-        raise RuntimeError(f"Alpaca {method} {path} failed after {retries} attempts: {last_err}")
+        raise RuntimeError(f"Alpaca {method} {path} failed after {total_retries} attempts: {last_err}")
 
     def get_account(self) -> dict:
         r = self._request("GET", "/v2/account")

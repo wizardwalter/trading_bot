@@ -146,7 +146,15 @@ def build_signal(symbol: str) -> Signal:
     # current model historically overtrades and bleeds on fees/slippage.
     risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > 0.02
 
-    if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion and not risk_off_regime:
+    # Require at least one supportive regime signal for non-rebound buys.
+    bullish_alignment = (trend_component > 0.0) or (momentum_component > 0.0 and short_momentum_component > -0.05)
+
+    if (
+        (score > buy_threshold or oversold_rebound or extreme_oversold_reversal)
+        and not overbought_exhaustion
+        and not risk_off_regime
+        and (bullish_alignment or oversold_rebound or extreme_oversold_reversal)
+    ):
         action = "buy"
     elif overbought_exit or (score < sell_threshold and bearish_confirmation) or risk_off_regime:
         action = "sell"
