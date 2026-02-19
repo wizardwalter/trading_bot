@@ -42,7 +42,12 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
     )
 
     broker = AlpacaBroker()
-    account = broker.get_account()
+    try:
+        account = broker.get_account()
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] ⚠️ Unable to fetch account snapshot: {e}")
+        return
+
     start_equity = float(account.get("equity", 0.0))
 
     tickers = get_all_tickers()
@@ -58,7 +63,12 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 print(f"[{datetime.utcnow().isoformat()}] 🕒 Market closed for {ticker}, skipping")
                 continue
 
-            account_now = broker.get_account()
+            try:
+                account_now = broker.get_account()
+            except Exception as e:
+                print(f"[{datetime.utcnow().isoformat()}] ⚠️ Account fetch failed for {ticker}: {e}")
+                continue
+
             current_equity = float(account_now.get("equity", 0.0))
             if drawdown_exceeded(start_equity, current_equity):
                 print("🛑 Daily drawdown limit reached. Halting trading loop.")
@@ -79,7 +89,7 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 volatility=decision["volatility"],
                 max_risk_per_trade=MAX_RISK_PER_TRADE,
             )
-            buying_power = broker.get_buying_power()
+            buying_power = float(account_now.get("buying_power") or account_now.get("equity") or 0.0)
             qty_bp_raw = (buying_power * POSITION_FRACTION) / max(decision["price"], 0.01)
             qty_bp = _normalize_qty(ticker, qty_bp_raw)
             # Use the tighter of risk sizing and buying-power sizing.
@@ -109,7 +119,11 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 continue
 
             if action == "buy":
-                positions = broker.get_positions()
+                try:
+                    positions = broker.get_positions()
+                except Exception as e:
+                    print(f"[{datetime.utcnow().isoformat()}] ⚠️ Positions fetch failed for {ticker}: {e}")
+                    continue
                 current_exposure = sum(max(float(p.get("market_value", 0.0)), 0.0) for p in positions)
 
                 symbol_position = next((p for p in positions if p.get("symbol", "").upper() == ticker.replace("-", "").upper()), None)

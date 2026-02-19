@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import requests
 
 from config.settings import ALPACA_BASE_URL, APCA_API_KEY_ID, APCA_API_SECRET_KEY
@@ -33,13 +35,25 @@ class AlpacaBroker:
             }
         )
 
+    def _request(self, method: str, path: str, timeout: int = 15, retries: int = 3, **kwargs):
+        last_err: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                response = self.session.request(method, f"{self.base_url}{path}", timeout=timeout, **kwargs)
+                return response
+            except requests.RequestException as e:
+                last_err = e
+                if attempt < retries:
+                    time.sleep(0.5 * attempt)
+        raise RuntimeError(f"Alpaca {method} {path} failed after {retries} attempts: {last_err}")
+
     def get_account(self) -> dict:
-        r = self.session.get(f"{self.base_url}/v2/account", timeout=15)
+        r = self._request("GET", "/v2/account")
         r.raise_for_status()
         return r.json()
 
     def get_positions(self) -> list[dict]:
-        r = self.session.get(f"{self.base_url}/v2/positions", timeout=15)
+        r = self._request("GET", "/v2/positions")
         if r.status_code == 404:
             return []
         r.raise_for_status()
@@ -52,7 +66,7 @@ class AlpacaBroker:
     def get_position_qty(self, symbol: str) -> float:
         symbol = _to_alpaca_symbol(symbol)
         try:
-            r = self.session.get(f"{self.base_url}/v2/positions/{symbol}", timeout=15)
+            r = self._request("GET", f"/v2/positions/{symbol}")
             if r.status_code == 404:
                 return 0.0
             r.raise_for_status()
@@ -79,6 +93,6 @@ class AlpacaBroker:
             "type": "market",
             "time_in_force": tif,
         }
-        r = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=15)
+        r = self._request("POST", "/v2/orders", json=payload)
         r.raise_for_status()
         return r.json()

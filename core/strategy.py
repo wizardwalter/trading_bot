@@ -142,9 +142,13 @@ def build_signal(symbol: str) -> Signal:
 
     bearish_confirmation = (trend_component < -0.03 and short_momentum_component < 0.0)
 
-    if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion:
+    # Regime filter: avoid new entries in high-volatility downside chop where the
+    # current model historically overtrades and bleeds on fees/slippage.
+    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > 0.02
+
+    if (score > buy_threshold or oversold_rebound or extreme_oversold_reversal) and not overbought_exhaustion and not risk_off_regime:
         action = "buy"
-    elif overbought_exit or (score < sell_threshold and bearish_confirmation):
+    elif overbought_exit or (score < sell_threshold and bearish_confirmation) or risk_off_regime:
         action = "sell"
     else:
         action = "hold"
