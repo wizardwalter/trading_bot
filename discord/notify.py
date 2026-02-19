@@ -1,5 +1,12 @@
 import os
+from pathlib import Path
+
 import requests
+from dotenv import load_dotenv
+
+# Ensure .env is loaded even in isolated cron runs.
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 TRAINING_WEBHOOK_URL = os.getenv("TRAINING_WEBHOOK_URL")
