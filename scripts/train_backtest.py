@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from discord.notify import send_training_update
 
 OUT_DIR = Path("data/backtests")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -229,6 +235,13 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     out_file.write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
     print(f"\nSaved: {out_file}")
+
+    send_training_update(
+        "Backtest iteration complete | "
+        f"symbol={symbol} {interval} {period} | "
+        f"train_ret={best.total_return:.2%}, test_ret={test.total_return:.2%}, "
+        f"test_wr={test.win_rate:.1%}, maxDD={test.max_drawdown:.2%}, thr={best.threshold:.2f}"
+    )
 
 
 if __name__ == "__main__":

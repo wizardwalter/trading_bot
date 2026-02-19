@@ -2,15 +2,20 @@ import os
 import requests
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+TRAINING_WEBHOOK_URL = os.getenv("TRAINING_WEBHOOK_URL")
+
+
+def _send_to(url: str | None, content: str):
+    if not url:
+        return
+    try:
+        requests.post(url, json={"content": content}, timeout=10)
+    except Exception:
+        pass
 
 
 def _send(content: str):
-    if not DISCORD_WEBHOOK_URL:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
-    except Exception:
-        pass
+    _send_to(DISCORD_WEBHOOK_URL, content)
 
 
 def send_trade_alert(ticker, action, price, quantity, confidence, reason, paper=True):
@@ -25,3 +30,8 @@ def send_trade_alert(ticker, action, price, quantity, confidence, reason, paper=
 
 def send_status_update(message: str):
     _send(f"📊 {message}")
+
+
+def send_training_update(message: str):
+    # Prefer dedicated training channel; fallback to default webhook if unset.
+    _send_to(TRAINING_WEBHOOK_URL or DISCORD_WEBHOOK_URL, f"🧠 {message}")
