@@ -16,7 +16,11 @@ def run_loop(interval_seconds: int = 60, execute_orders: bool = False, status_ev
         started = datetime.utcnow().isoformat()
         print(f"[{started}] 🔁 Loop {loop_num} start")
 
-        run_bot(paper_mode=True, execute_orders=execute_orders)
+        try:
+            run_bot(paper_mode=True, execute_orders=execute_orders)
+        except Exception as e:
+            print(f"[{datetime.utcnow().isoformat()}] ⚠️ loop error: {e.__class__.__name__}: {e}")
+            send_status_update(f"loop warning: {e.__class__.__name__} (will retry)")
 
         if loop_num % max(status_every_loops, 1) == 0:
             use_db_perf = os.getenv("ENABLE_DB_PERF", "0") == "1"
