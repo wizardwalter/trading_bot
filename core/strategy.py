@@ -133,7 +133,7 @@ def _symbol_profile(symbol: str) -> dict:
     }
 
 
-def build_signal(symbol: str) -> Signal:
+def build_signal(symbol: str, has_position: bool = False) -> Signal:
     profile = _symbol_profile(symbol)
     df = _features(_download(symbol, interval=profile["interval"], period=profile["period"]))
     row = df.iloc[-1]
@@ -193,15 +193,23 @@ def build_signal(symbol: str) -> Signal:
     # Require at least one supportive regime signal for non-rebound buys.
     bullish_alignment = (trend_component > 0.0) or (momentum_component > 0.0 and short_momentum_component > -0.05)
 
+    # Selective counter-trend allowance for washed-out reversals to avoid getting
+    # stuck in perpetual HOLD during deep but stabilizing pullbacks.
+    allow_countertrend_reversal = (
+        extreme_oversold_reversal
+        and vol < 0.03
+        and trend_component > -0.30
+    )
+
     if (
         (score > buy_threshold or oversold_rebound or extreme_oversold_reversal)
         and not overbought_exhaustion
-        and not risk_off_regime
+        and (not risk_off_regime or allow_countertrend_reversal)
         and (bullish_alignment or oversold_rebound or extreme_oversold_reversal)
     ):
         action = "buy"
     elif overbought_exit or (score < sell_threshold and bearish_confirmation) or risk_off_regime:
-        action = "sell"
+        action = "sell" if has_position else "hold"
     else:
         action = "hold"
 
@@ -246,8 +254,8 @@ def position_size(equity: float, price: float, volatility: float, max_risk_per_t
     return max(float(qty), 0.0)
 
 
-def should_enter_trade(ticker: str) -> Dict:
-    signal = build_signal(ticker)
+def should_enter_trade(ticker: str, has_position: bool = False) -> Dict:
+    signal = build_signal(ticker, has_position=has_position)
     return {
         "enter": signal.action in ("buy", "sell"),
         "action": signal.action,

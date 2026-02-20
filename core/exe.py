@@ -81,7 +81,8 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 break
 
             print(f"[{datetime.utcnow().isoformat()}] 🔍 Analyzing {ticker}...")
-            decision = should_enter_trade(ticker)
+            current_qty = broker.get_position_qty(ticker)
+            decision = should_enter_trade(ticker, has_position=(current_qty > 0))
             latest_prices[ticker] = decision["price"]
 
             action = decision["action"]
@@ -101,7 +102,6 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             # Use the tighter of risk sizing and buying-power sizing.
             qty = min(float(qty_risk), float(qty_bp))
 
-            current_qty = broker.get_position_qty(ticker)
             if action == "sell" and current_qty <= 0:
                 print(f"[{datetime.utcnow().isoformat()}] ⏭️ Skip SELL {ticker} (no position)")
                 continue
