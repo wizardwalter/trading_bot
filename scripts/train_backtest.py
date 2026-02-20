@@ -92,21 +92,21 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
     sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
 
-    # Slightly earlier overbought filtering and deeper oversold allowance improved OOS behavior.
-    overbought = rsi > 70
-    oversold = rsi < 22
+    # Tuned thresholds: slightly later overbought filtering and deeper oversold allowance.
+    overbought = rsi > 71
+    oversold = rsi < 19
 
     # Reduce entries during volatile chop unless directional conviction is strong.
     vol_guard = vol <= np.nanpercentile(vol, 85)
 
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.12)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.12)
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13)
 
-    long_entry = (score > buy_threshold) & bullish_confirmation & (~overbought) & (vol_guard | (trend > 0.25))
-    short_entry = (score < sell_threshold) & bearish_confirmation & (~oversold) & (vol_guard | (trend < -0.25))
+    long_entry = (score > buy_threshold) & bullish_confirmation & (~overbought) & (vol_guard | (trend > 0.20))
+    short_entry = (score < sell_threshold) & bearish_confirmation & (~oversold) & (vol_guard | (trend < -0.20))
 
-    long_exit = (score < -0.01) | (overbought & (m3 < 0.08)) | ((trend < -0.08) & (m3 < -0.15))
-    short_exit = (score > 0.01) | (oversold & (m3 > -0.08)) | ((trend > 0.08) & (m3 > 0.15))
+    long_exit = (score < -0.011) | (overbought & (m3 < 0.08)) | ((trend < -0.08) & (m3 < -0.15))
+    short_exit = (score > 0.008) | (oversold & (m3 > -0.08)) | ((trend > 0.08) & (m3 > 0.15))
 
     position = np.zeros(len(df), dtype=np.int8)
     state = 0
