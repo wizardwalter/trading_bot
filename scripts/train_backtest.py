@@ -269,15 +269,21 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
 
             # Prefer thresholds that are consistent across folds, not just high average.
             if fold_metrics:
-                ret_std = float(np.std([m.total_return for m in fold_metrics]))
-                worst_fold_return = float(min(m.total_return for m in fold_metrics))
+                fold_returns = [m.total_return for m in fold_metrics]
+                fold_trade_counts = [m.trades for m in fold_metrics]
+                ret_std = float(np.std(fold_returns))
+                worst_fold_return = float(min(fold_returns))
+                median_fold_return = float(np.median(fold_returns))
                 worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
                 recent_fold_return = float(fold_metrics[-1].total_return)
+                avg_fold_trades = float(np.mean(fold_trade_counts))
                 stability_penalty = (
                     (ret_std * 1.8)
                     + (abs(min(worst_fold_return, 0.0)) * 0.7)
+                    + (abs(min(median_fold_return, 0.0)) * 0.5)
                     + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
                     + (abs(min(recent_fold_return, 0.0)) * 0.6)
+                    + (0.08 if avg_fold_trades < 2.0 else 0.0)
                 )
             else:
                 stability_penalty = 0.45
