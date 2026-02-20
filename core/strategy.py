@@ -76,7 +76,7 @@ def _features(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna()
 
 
-def _load_backtest_threshold(symbol: str, fallback: float) -> float:
+def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: str | None = None) -> float:
     if os.getenv("USE_BACKTEST_THRESHOLD", "1") != "1":
         return fallback
 
@@ -90,6 +90,19 @@ def _load_backtest_threshold(symbol: str, fallback: float) -> float:
         return fallback
 
     if str(payload.get("symbol", "")).upper() != symbol.upper():
+        return fallback
+
+    # Guard against applying a threshold calibrated for a different bar interval.
+    if expected_interval and str(payload.get("interval", "")).lower() != str(expected_interval).lower():
+        return fallback
+
+    # Guard against stale calibrations lingering for too long.
+    max_age_hours = float(os.getenv("BACKTEST_MAX_AGE_HOURS", "72"))
+    try:
+        age_s = time.time() - path.stat().st_mtime
+        if max_age_hours > 0 and age_s > (max_age_hours * 3600):
+            return fallback
+    except Exception:
         return fallback
 
     candidate = payload.get("test", {}).get("threshold")
@@ -106,10 +119,11 @@ def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
         base = 0.14  # tighter BTC threshold to reduce churn in noisy microstructure
+        interval = "1m"
         return {
-            "interval": "1m",
+            "interval": interval,
             "period": "2d",
-            "entry_threshold": _load_backtest_threshold(s, base),
+            "entry_threshold": _load_backtest_threshold(s, base, expected_interval=interval),
         }
     # default day-trading profile for equities
     return {
@@ -223,13 +237,13 @@ def build_signal(symbol: str) -> Signal:
     )
 
 
-def position_size(equity: float, price: float, volatility: float, max_risk_per_trade: float = 0.01) -> int:
+def position_size(equity: float, price: float, volatility: float, max_risk_per_trade: float = 0.01) -> float:
     risk_budget = max(equity, 0.0) * max_risk_per_trade
     risk_per_unit = price * max(volatility, 0.005)
     if risk_per_unit <= 0:
-        return 0
-    qty = int(risk_budget / risk_per_unit)
-    return max(qty, 0)
+        return 0.0
+    qty = risk_budget / risk_per_unit
+    return max(float(qty), 0.0)
 
 
 def should_enter_trade(ticker: str) -> Dict:
