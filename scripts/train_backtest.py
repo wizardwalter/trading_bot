@@ -47,6 +47,8 @@ def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d",
 
 def features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # Base features
     out["ema_fast"] = out["Close"].ewm(span=12, adjust=False).mean()
     out["ema_slow"] = out["Close"].ewm(span=26, adjust=False).mean()
 
@@ -60,13 +62,15 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_20"] = out["Close"].pct_change(20)
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["volatility"] = out["hl_spread"].rolling(20).mean().fillna(0.002)
+
+    # Additional features: volume, volume changes, multi-timeframe
     out["ema_ratio"] = ((out["Close"] / out["ema_slow"]) - 1).clip(-0.2, 0.2)
     out["macd_hist"] = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-0.2, 0.2)
     out["price_momentum"] = out["Close"].pct_change().rolling(6).mean().clip(-0.05, 0.05)
+
     vol_growth = out["Volume"].pct_change(36).replace([np.inf, -np.inf], np.nan)
     out["volume_trend"] = vol_growth.ewm(span=24, adjust=False).mean().clip(-4, 4).fillna(0.0)
 
-    # Volume and range context for regime detection.
     volume = out["Volume"].ffill()
     vol_mean = volume.rolling(96).mean()
     vol_std = volume.rolling(96).std().replace(0, np.nan)
@@ -86,7 +90,9 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     intraday_position = ((out["Close"] - out["Low"]) / (high_low.replace(0, np.nan))).clip(0, 1) - 0.5
     out["range_score"] = intraday_position.rolling(12).mean().fillna(0.0)
 
-    out = out.dropna().copy()
+    # Multi-timeframe signals: add moving averages with longer windows
+    out["ema_fast_2"] = out["Close"].ewm(span=24, adjust=False).mean()
+    out["ema_slow_2"] = out["Close"].ewm(span=52, adjust=False).mean()
 
     trend = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-1, 1) * 220
     trend = trend.clip(-1, 1)
@@ -97,7 +103,6 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     volume_bias = np.tanh(out["volume_z"].clip(-3, 3) / 1.8)
     range_component = out["range_score"].clip(-1, 1)
 
-    # Bias toward RSI mean-reversion while preserving trend context for fewer whipsaws.
     out["score"] = 0.35 * trend + 0.15 * m20 + 0.05 * m3 + 0.45 * rsi_comp
     out["score_raw"] = out["score"]
     out["trend"] = trend
@@ -105,7 +110,10 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["m20"] = m20
     out["volume_bias"] = volume_bias
     out["range_score"] = range_component
+
+    out = out.dropna().copy()
     return out
+
 
 
 @dataclass
@@ -590,6 +598,9 @@ def _build_webhook_metrics(symbol: str, interval: str, period: str, mode: str, t
     return msg
 
 
+from ml.neural_model import NeuralSequenceModel, SequenceDataset, train_neural_model, neural_inference
+from torch.utils.data import DataLoader
+
 def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_cols: list[str]) -> dict[str, Any] | None:
     if len(df) <= horizon or train_rows <= horizon:
         return None
@@ -699,6 +710,71 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
                 "acc": float(acc),
             }
         )
+
+    # Neural candidate training and evaluation
+    try:
+        neural_model = NeuralSequenceModel(input_dim=len(feature_cols))
+        sequence_length = 12
+
+        target = df["Close"].pct_change(horizon).shift(-horizon)
+        label = (target > 0).astype(int)
+        valid_mask = label.notna().to_numpy().copy()
+        valid_mask[-horizon:] = False
+
+        train_mask = np.zeros(len(df), dtype=bool)
+        train_mask[:train_rows] = True
+        train_mask &= valid_mask
+
+        train_idx = np.flatnonzero(train_mask)
+        if train_idx.size < 320:
+            raise ValueError("Insufficient training data for neural model")
+
+        val_size = max(int(train_idx.size * 0.2), 120)
+        if val_size >= train_idx.size:
+            raise ValueError("Insufficient validation data for neural model")
+
+        core_idx = train_idx[:-val_size]
+        val_idx = train_idx[-val_size:]
+
+        feat_df = df[feature_cols]
+        label_series = label
+
+        X_core = feat_df.iloc[core_idx]
+        y_core = label_series.iloc[core_idx]
+
+        X_val = feat_df.iloc[val_idx]
+        y_val = label_series.iloc[val_idx]
+
+        train_dataset = SequenceDataset(X_core, y_core, sequence_length=sequence_length)
+        val_dataset = SequenceDataset(X_val, y_val, sequence_length=sequence_length)
+
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        trained_model = train_neural_model(
+            neural_model, train_loader, val_loader, epochs=10, lr=0.001, device=device
+        )
+
+        val_features = feat_df.iloc[val_idx:].values
+        preds = neural_inference(trained_model, val_features, sequence_length=sequence_length, device=device)
+
+        auc = roc_auc_score(y_val[sequence_length:], preds)
+        pred_labels = (preds >= 0.5).astype(int)
+        acc = accuracy_score(y_val[sequence_length:], pred_labels)
+
+        evaluated.append(
+            {
+                "name": "neural_sequence",
+                "pipeline": trained_model,
+                "auc": float(auc),
+                "acc": float(acc),
+            }
+        )
+    except Exception as err:
+        print(f"Neural candidate training failed: {err}")
+
+
 
     if not evaluated:
         return None
@@ -847,11 +923,15 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
     )
 
 
+from ml.model_orchestrator import ModelOrchestrator
+
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     raw = download(symbol=symbol, interval=interval, period=period)
     df = features(raw)
     if len(df) < 200:
         raise RuntimeError(f"insufficient feature rows for backtest: {len(df)}")
+
+    orchestrator = ModelOrchestrator()
 
     split = int(len(df) * 0.7)
     _blend_with_ml_signal(df, split)
@@ -861,6 +941,15 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
 
     best = pick_best(train_df)
     test = simulate(test_df, best.threshold)
+
+    # Check for champion promotion
+    champion_model, champion_metrics = orchestrator.get_champion()
+    challenger_metrics = asdict(test)
+    challenger_metrics["threshold"] = best.threshold
+
+    if orchestrator.should_promote(challenger_metrics):
+        orchestrator.promote("latest_model", challenger_metrics)
+        print("[ORCHESTRATION] Promoted new champion model based on improved performance.")
 
     result = {
         "symbol": symbol,
