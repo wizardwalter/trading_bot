@@ -130,6 +130,15 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     volume_bias = df["volume_bias"].values
     range_score = df["range_score"].values
 
+    if "score_ml" in df.columns:
+        score_ml = df["score_ml"].values
+    else:
+        score_ml = score
+    if "score_ml_raw" in df.columns:
+        score_ml_raw = df["score_ml_raw"].values
+    else:
+        score_ml_raw = score_ml
+
     exit_cooldown_bars = 3
     flip_cooldown_bars = 1
 
@@ -165,6 +174,13 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     range_ok_long = range_score > -0.05
     range_ok_short = range_score < 0.02
 
+    ml_bias = max(0.02, float(threshold) * 0.22)
+    ml_relief = np.clip(volume_bias * 0.01, -0.02, 0.02)
+    long_ml_gate = score_ml > (ml_bias - ml_relief)
+    short_ml_gate = score_ml < (-ml_bias - ml_relief)
+    long_override = score > (buy_threshold + 0.05)
+    short_override = score < (sell_threshold - 0.05)
+
     bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13)
     bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13)
 
@@ -175,6 +191,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & (vol_guard | (trend > 0.20) | (volume_bias > 0.35))
         & range_ok_long
         & (~high_vol_penalty_long)
+        & (long_ml_gate | long_override)
     )
     short_entry = (
         (score < sell_threshold)
@@ -183,6 +200,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & (vol_guard | (trend < -0.20) | (volume_bias < -0.35))
         & range_ok_short
         & (~high_vol_penalty_short)
+        & (short_ml_gate | short_override)
     )
 
     long_exit = (
@@ -321,12 +339,14 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 def _score_metrics(m: Metrics) -> float:
     trades_penalty = 0.0
     if m.trades < 8:
-        trades_penalty = 0.20
-    elif m.trades > 26:
-        trades_penalty = 0.15
+        trades_penalty = 0.35
+    elif m.trades < 12:
+        trades_penalty = 0.18
+    elif m.trades > 32:
+        trades_penalty = 0.17
 
-    risk_penalty = 0.10 if m.max_drawdown < -0.10 else 0.0
-    expectancy_penalty = 0.10 if (m.expectancy < 0 and m.win_rate < 0.35) else 0.0
+    risk_penalty = 0.12 if m.max_drawdown < -0.11 else (0.05 if m.max_drawdown < -0.08 else 0.0)
+    expectancy_penalty = 0.12 if (m.expectancy < 0 and m.win_rate < 0.4) else 0.0
 
     return (
         (m.total_return * 3.2)
@@ -357,15 +377,18 @@ def _neighbor_instability_penalty(df: pd.DataFrame, threshold: float, base_retur
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
-    def evaluate_candidates(candidates: np.ndarray) -> list[tuple[float, Metrics]]:
-        n = len(train_df)
-        fold_start = int(n * 0.30)
-        fold_ends = [int(n * 0.50), int(n * 0.65), int(n * 0.80), n]
+    n = len(train_df)
+    fold_start = int(n * 0.30)
+    fold_ends = [int(n * 0.50), int(n * 0.65), int(n * 0.80), n]
+    recent_start = int(n * 0.55)
+    recent_window = train_df.iloc[recent_start:] if (n - recent_start) >= 240 else None
 
-        scored_local: list[tuple[float, Metrics]] = []
+    def evaluate_candidates(candidates: np.ndarray) -> list[tuple[float, Metrics, dict[str, float]]]:
+        scored_local: list[tuple[float, Metrics, dict[str, float]]] = []
         for th in candidates:
             full_m = simulate(train_df, float(th))
             instability_penalty = _neighbor_instability_penalty(train_df, float(th), full_m.total_return)
+            trade_scarcity_penalty = max(0.0, (6 - min(full_m.trades, 6)) * 0.03)
 
             fold_metrics: list[Metrics] = []
             prev = fold_start
@@ -378,20 +401,37 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
 
             fold_scores = [_score_metrics(m) for m in fold_metrics]
             if fold_scores:
-                # Slightly overweight more recent folds to better match OOS deployment conditions.
                 base_weights = np.array([1.0, 1.2, 1.5, 1.8], dtype=float)
                 w = base_weights[-len(fold_scores) :]
                 cv_score = float(np.average(fold_scores, weights=w))
             else:
                 cv_score = -1.0
 
-            # Prefer thresholds that are consistent across folds, not just high average.
+            fold_returns = [m.total_return for m in fold_metrics]
+            fold_trade_counts = [m.trades for m in fold_metrics]
+            fold_positive = sum(1 for r in fold_returns if r > 0)
+            fold_count = len(fold_metrics)
+            median_fold_return = float(np.median(fold_returns)) if fold_returns else 0.0
+            worst_fold_return = float(min(fold_returns)) if fold_returns else 0.0
+            ret_std = float(np.std(fold_returns)) if fold_returns else 0.0
+            pessimistic_return = median_fold_return - (abs(min(worst_fold_return, 0.0)) * 0.55) - (ret_std * 0.65)
+
+            recent_penalty = 0.0
+            recent_bonus = 0.0
+            recent_last_return = 0.0
+            if recent_window is not None and len(recent_window) >= 200:
+                recent_m = simulate(recent_window, float(th))
+                recent_last_return = recent_m.total_return
+                if recent_m.total_return < 0:
+                    recent_penalty += abs(recent_m.total_return) * 0.9
+                else:
+                    recent_bonus += min(recent_m.total_return * 0.6, 0.10)
+                if recent_m.max_drawdown < -0.09:
+                    recent_penalty += abs(recent_m.max_drawdown + 0.055) * 0.6
+                if recent_m.trades < 4:
+                    recent_penalty += 0.04
+
             if fold_metrics:
-                fold_returns = [m.total_return for m in fold_metrics]
-                fold_trade_counts = [m.trades for m in fold_metrics]
-                ret_std = float(np.std(fold_returns))
-                worst_fold_return = float(min(fold_returns))
-                median_fold_return = float(np.median(fold_returns))
                 worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
                 recent_fold_return = float(fold_metrics[-1].total_return)
                 avg_fold_trades = float(np.mean(fold_trade_counts))
@@ -404,20 +444,37 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
                     + (0.08 if avg_fold_trades < 2.0 else 0.0)
                 )
             else:
-                stability_penalty = 0.45
+                avg_fold_trades = 0.0
+                stability_penalty = 0.45 + recent_penalty - recent_bonus
+                recent_fold_return = 0.0
 
-            score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty - (instability_penalty * 0.75)
-            scored_local.append((score, full_m))
+            score = (
+                (_score_metrics(full_m) * 0.40)
+                + (cv_score * 0.60)
+                - stability_penalty
+                - (instability_penalty * 0.75)
+                - recent_penalty
+                + recent_bonus
+                - trade_scarcity_penalty
+            )
+            extras = {
+                "fold_positive": float(fold_positive),
+                "fold_count": float(fold_count),
+                "median_fold_return": float(median_fold_return),
+                "worst_fold_return": float(worst_fold_return),
+                "pessimistic_return": float(pessimistic_return),
+                "avg_fold_trades": float(avg_fold_trades),
+                "recent_last_return": float(recent_last_return),
+            }
+            scored_local.append((score, full_m, extras))
 
         return scored_local
 
-    # Stage 1: coarse sweep across a wide range.
     coarse = np.arange(0.05, 0.71, 0.01)
     scored = evaluate_candidates(coarse)
 
-    # Stage 2: local refinement around the strongest coarse candidates.
     top_seed = sorted(scored, key=lambda x: x[0], reverse=True)[:4]
-    centers = [m.threshold for _, m in top_seed]
+    centers = [m.threshold for _, m, _ in top_seed]
     refined_vals: set[float] = set()
     for c in centers:
         for th in np.arange(max(0.03, c - 0.03), min(0.80, c + 0.03) + 1e-9, 0.002):
@@ -426,30 +483,82 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     if len(refined) > 0:
         scored.extend(evaluate_candidates(refined))
 
-    # Keep the best score for each threshold after coarse+refined sweeps.
-    best_by_th: dict[float, tuple[float, Metrics]] = {}
-    for score, m in scored:
+    best_by_th: dict[float, tuple[float, Metrics, dict[str, float]]] = {}
+    for score, m, extras in scored:
         th = round(m.threshold, 3)
         prev = best_by_th.get(th)
         if prev is None or score > prev[0]:
-            best_by_th[th] = (score, m)
+            best_by_th[th] = (score, m, extras)
     deduped = list(best_by_th.values())
 
-    # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
-    # A 5-trade floor keeps the strategy active while allowing higher-quality selective entries.
+    def _robust_key(item: tuple[float, Metrics, dict[str, float]]) -> float:
+        score, m, extras = item
+        return (
+            score
+            + (extras["pessimistic_return"] * 5.0)
+            + (extras["median_fold_return"] * 3.0)
+            - (abs(m.max_drawdown + 0.07) * 0.45)
+            - (abs(m.trades - 16) * 0.03)
+        )
+
     viable = [
-        (score, m)
-        for score, m in deduped
-        if m.total_return > 0 and m.max_drawdown >= -0.12 and m.trades >= 5
+        (score, m, extras)
+        for score, m, extras in deduped
+        if (
+            m.total_return > 0
+            and m.max_drawdown >= -0.11
+            and m.trades >= 8
+            and extras["fold_count"] >= 3
+            and extras["fold_positive"] >= max(2.0, extras["fold_count"] - 1)
+            and extras["median_fold_return"] > 0
+            and extras["pessimistic_return"] > -0.005
+        )
     ]
 
     if viable:
+        return max(viable, key=_robust_key)[1]
+
+    trade_balanced = [
+        (score, m, extras)
+        for score, m, extras in deduped
+        if (
+            m.total_return > 0
+            and m.trades >= 9
+            and m.max_drawdown >= -0.17
+            and extras["median_fold_return"] > -0.01
+        )
+    ]
+    if trade_balanced:
+        sweet_spot = 18
         return max(
-            viable,
-            key=lambda x: (x[0], x[1].total_return, x[1].sharpe_like, -abs(x[1].trades - 16), -x[1].threshold),
+            trade_balanced,
+            key=lambda x: (
+                x[0],
+                x[1].total_return * 1.1,
+                -abs(x[1].trades - sweet_spot),
+                x[1].win_rate,
+                -abs(x[1].max_drawdown + 0.08),
+                x[2]["median_fold_return"],
+            ),
         )[1]
 
-    # Fallback: least-bad threshold by blended return/risk score.
+    activity_guard = [
+        (score, m, extras)
+        for score, m, extras in deduped
+        if m.total_return > 0 and m.trades >= 4
+    ]
+    if activity_guard:
+        return max(
+            activity_guard,
+            key=lambda x: (
+                x[0],
+                -abs(x[1].trades - 12),
+                x[1].total_return,
+                x[1].sharpe_like,
+                -abs(x[1].max_drawdown + 0.1),
+            ),
+        )[1]
+
     return max(
         deduped,
         key=lambda x: (x[0], x[1].total_return, x[1].max_drawdown, x[1].sharpe_like, -x[1].threshold),
@@ -599,8 +708,8 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
     acc = best_model["acc"]
     model_name = best_model["name"]
 
-    min_auc = 0.53
-    min_acc = 0.52
+    min_auc = 0.512
+    min_acc = 0.51
     if (not np.isfinite(auc)) or auc < min_auc or acc < min_acc:
         safe_auc = float(auc) if np.isfinite(auc) else float("nan")
         print(
@@ -666,33 +775,74 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         return
 
     base_score = df["score"].clip(-1.0, 1.0)
-    best: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = []
 
     for horizon in horizons:
         candidate = _fit_ml_candidate(df, train_rows, horizon, feature_cols)
         if candidate is None:
             continue
+        candidates.append(candidate)
 
-        if best is None:
-            best = candidate
-            continue
-
-        if (candidate["auc"] > best["auc"] + 0.002) or (
-            abs(candidate["auc"] - best["auc"]) <= 0.002 and candidate["acc"] > best["acc"]
-        ):
-            best = candidate
-
-    if best is None:
+    if not candidates:
         print("Hybrid ML signal skipped: no horizon met validation criteria")
         return
 
-    df["score_ml_raw"] = best["raw"]
-    df["score_ml"] = best["smoothed"]
-    df["score"] = (best["weight"] * best["smoothed"]) + ((1.0 - best["weight"]) * base_score)
+    candidates.sort(key=lambda item: (item["auc"], item["acc"]), reverse=True)
+    primary = candidates[0]
+
+    blend_group: list[dict[str, Any]] = [primary]
+    for candidate in candidates[1:]:
+        auc_close = candidate["auc"] >= primary["auc"] - 0.02
+        acc_close = candidate["acc"] >= primary["acc"] - 0.03
+        if auc_close and acc_close:
+            blend_group.append(candidate)
+        if len(blend_group) >= 3:
+            break
+
+    weights: list[float] = []
+    sum_weights = 0.0
+    raw_combo = None
+    smooth_combo = None
+
+    for idx, candidate in enumerate(blend_group):
+        decay = max(0.55, 1.0 - (0.18 * idx))
+        weight = candidate["weight"] * decay
+        weights.append(weight)
+        sum_weights += weight
+        contrib_raw = candidate["raw"] * weight
+        contrib_smooth = candidate["smoothed"] * weight
+        raw_combo = contrib_raw if raw_combo is None else raw_combo + contrib_raw
+        smooth_combo = contrib_smooth if smooth_combo is None else smooth_combo + contrib_smooth
+
+    if sum_weights <= 0 or raw_combo is None or smooth_combo is None:
+        print("Hybrid ML signal skipped: blend weights collapsed to zero")
+        return
+
+    combined_raw = (raw_combo / sum_weights).clip(-1.0, 1.0)
+    combined_smoothed = (smooth_combo / sum_weights).clip(-1.0, 1.0)
+
+    base_std = float(base_score.std()) if hasattr(base_score, "std") else 0.0
+    ml_std = float(combined_smoothed.std()) if hasattr(combined_smoothed, "std") else 0.0
+    if ml_std > 0 and base_std > 0:
+        scale = float(np.clip(base_std / ml_std, 0.6, 1.6))
+        combined_raw = (combined_raw * scale).clip(-1.0, 1.0)
+        combined_smoothed = (combined_smoothed * scale).clip(-1.0, 1.0)
+
+    max_weight = 0.38 if len(blend_group) == 1 else 0.45
+    effective_weight = min(max_weight, sum_weights)
+
+    df["score_ml_raw"] = combined_raw
+    df["score_ml"] = combined_smoothed
+    df["score"] = (effective_weight * combined_smoothed) + ((1.0 - effective_weight) * base_score)
+
+    blend_summary = ", ".join(
+        f"h={c['horizon']}, model={c['model']}, auc={c['auc']:.3f}, acc={c['acc']:.3f}, w={w:.2f}"
+        for c, w in zip(blend_group, weights)
+    )
     print(
         "Hybrid ML signal applied ("
-        f"h={best['horizon']}, model={best['model']}, auc={best['auc']:.3f}, acc={best['acc']:.3f}, "
-        f"weight={best['weight']:.2f}, n_val={best['val_size']}"
+        f"{len(blend_group)} models, effective_weight={effective_weight:.2f}; "
+        f"{blend_summary}"
         ")"
     )
 
