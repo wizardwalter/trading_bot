@@ -4,6 +4,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
@@ -133,9 +134,32 @@ def _symbol_profile(symbol: str) -> dict:
     }
 
 
+def _latest_bar_age_seconds(df: pd.DataFrame) -> float:
+    if df.empty:
+        return float("inf")
+    ts = df.index[-1]
+    try:
+        if isinstance(ts, pd.Timestamp):
+            ts = ts.to_pydatetime()
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max((now - ts).total_seconds(), 0.0)
+    except Exception:
+        return float("inf")
+
+
 def build_signal(symbol: str, has_position: bool = False) -> Signal:
     profile = _symbol_profile(symbol)
     df = _features(_download(symbol, interval=profile["interval"], period=profile["period"]))
+
+    max_staleness_s = float(os.getenv("MAX_MARKET_DATA_STALENESS_SECONDS", "240"))
+    latest_age_s = _latest_bar_age_seconds(df)
+    if latest_age_s > max_staleness_s:
+        raise ValueError(
+            f"Stale market data for {symbol}: last bar age {latest_age_s:.0f}s > {max_staleness_s:.0f}s"
+        )
+
     row = df.iloc[-1]
 
     price = float(row["Close"])
@@ -227,11 +251,14 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
     if overbought_exhaustion and action == "hold":
         setup_confidence_boost = max(setup_confidence_boost, 0.05)
 
-    confidence = min(base_confidence + setup_confidence_boost, 1.0)
+    # Damp confidence under elevated volatility so execution/risk filters reject
+    # more borderline entries during noisy regimes.
+    vol_conf_penalty = min(max((vol - 0.015) * 15.0, 0.0), 0.20)
+    confidence = min(max(base_confidence + setup_confidence_boost - vol_conf_penalty, 0.0), 1.0)
     reason = (
         f"trend={trend_component:+.2f}, momentum20={momentum_component:+.2f}, "
         f"momentum3={short_momentum_component:+.2f}, rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
-        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], conf={confidence:.2f}"
+        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], conf={confidence:.2f}, age_s={latest_age_s:.0f}"
     )
 
     return Signal(

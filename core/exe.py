@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from typing import Dict
 
@@ -24,6 +25,8 @@ MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "25"))
 MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "250"))
 CRYPTO_QTY_PRECISION = int(os.getenv("CRYPTO_QTY_PRECISION", "6"))
 ALLOW_PYRAMIDING = os.getenv("ALLOW_PYRAMIDING", "0") == "1"
+ACCOUNT_REFRESH_SECONDS = float(os.getenv("ACCOUNT_REFRESH_SECONDS", "45"))
+MAX_STALE_ACCOUNT_SECONDS = float(os.getenv("MAX_STALE_ACCOUNT_SECONDS", "180"))
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
@@ -42,7 +45,12 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
         f"[{datetime.utcnow().isoformat()}] 🚀 Trading bot started | paper_mode={paper_mode} | execute_orders={execute_orders}"
     )
 
-    broker = AlpacaBroker()
+    try:
+        broker = AlpacaBroker()
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] ⚠️ Broker init failed: {e}")
+        return
+
     try:
         account = broker.get_account()
     except Exception as e:
@@ -51,6 +59,7 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
 
     start_equity = float(account.get("equity", 0.0))
     last_account_snapshot = account
+    last_account_refresh_ts = time.time()
 
     tickers = get_all_tickers()
     if not tickers:
@@ -65,15 +74,22 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
                 print(f"[{datetime.utcnow().isoformat()}] 🕒 Market closed for {ticker}, skipping")
                 continue
 
-            try:
-                account_now = broker.get_account()
-                last_account_snapshot = account_now
-            except Exception as e:
+            now_ts = time.time()
+            need_refresh = (now_ts - last_account_refresh_ts) >= ACCOUNT_REFRESH_SECONDS
+
+            if need_refresh:
+                try:
+                    account_now = broker.get_account()
+                    last_account_snapshot = account_now
+                    last_account_refresh_ts = now_ts
+                except Exception as e:
+                    account_now = last_account_snapshot
+                    print(
+                        f"[{datetime.utcnow().isoformat()}] ⚠️ Account fetch failed for {ticker}; "
+                        f"using stale snapshot: {e}"
+                    )
+            else:
                 account_now = last_account_snapshot
-                print(
-                    f"[{datetime.utcnow().isoformat()}] ⚠️ Account fetch failed for {ticker}; "
-                    f"using stale snapshot: {e}"
-                )
 
             current_equity = float(account_now.get("equity", 0.0))
             if drawdown_exceeded(start_equity, current_equity):
@@ -88,6 +104,14 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
             action = decision["action"]
             if action == "hold":
                 print(f"[{datetime.utcnow().isoformat()}] ⏭️ HOLD {ticker} | {decision['reason']}")
+                continue
+
+            stale_age_s = time.time() - last_account_refresh_ts
+            if action == "buy" and stale_age_s > MAX_STALE_ACCOUNT_SECONDS:
+                print(
+                    f"[{datetime.utcnow().isoformat()}] ⏭️ Skip BUY {ticker} "
+                    f"(account snapshot stale {stale_age_s:.0f}s > {MAX_STALE_ACCOUNT_SECONDS:.0f}s)"
+                )
                 continue
 
             qty_risk = position_size(
