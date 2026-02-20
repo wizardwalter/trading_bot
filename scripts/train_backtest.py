@@ -6,12 +6,14 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
@@ -58,6 +60,11 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_20"] = out["Close"].pct_change(20)
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["volatility"] = out["hl_spread"].rolling(20).mean().fillna(0.002)
+    out["ema_ratio"] = ((out["Close"] / out["ema_slow"]) - 1).clip(-0.2, 0.2)
+    out["macd_hist"] = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-0.2, 0.2)
+    out["price_momentum"] = out["Close"].pct_change().rolling(6).mean().clip(-0.05, 0.05)
+    vol_growth = out["Volume"].pct_change(36).replace([np.inf, -np.inf], np.nan)
+    out["volume_trend"] = vol_growth.ewm(span=24, adjust=False).mean().clip(-4, 4).fillna(0.0)
 
     # Volume and range context for regime detection.
     volume = out["Volume"].ffill()
@@ -474,26 +481,9 @@ def _build_webhook_metrics(symbol: str, interval: str, period: str, mode: str, t
     return msg
 
 
-def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizon: int = 6) -> None:
+def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_cols: list[str]) -> dict[str, Any] | None:
     if len(df) <= horizon or train_rows <= horizon:
-        return
-
-    feature_cols = [
-        "score",
-        "trend",
-        "m3",
-        "m20",
-        "volume_bias",
-        "range_score",
-        "ret_3",
-        "ret_20",
-        "volatility",
-        "atr_pct",
-    ]
-
-    missing_cols = [c for c in feature_cols if c not in df.columns]
-    if missing_cols:
-        return
+        return None
 
     target = df["Close"].pct_change(horizon).shift(-horizon)
     label = (target > 0).astype(int)
@@ -506,17 +496,17 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizon: int = 6) -
 
     train_idx = np.flatnonzero(train_mask)
     if train_idx.size < 320:
-        return
+        return None
 
     val_size = max(int(train_idx.size * 0.2), 120)
     if val_size >= train_idx.size:
-        return
+        return None
 
     core_idx = train_idx[:-val_size]
     val_idx = train_idx[-val_size:]
 
     if core_idx.size < 200 or val_idx.size < 80:
-        return
+        return None
 
     feat_df = df[feature_cols]
     label_series = label
@@ -528,82 +518,183 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizon: int = 6) -
     y_val = label_series.iloc[val_idx]
 
     if y_core.nunique() < 2 or y_val.nunique() < 2:
-        return
+        return None
 
-    pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            (
-                "clf",
-                LogisticRegression(
-                    C=1.6,
-                    max_iter=800,
-                    class_weight="balanced",
-                    solver="lbfgs",
-                ),
+    model_builders = [
+        (
+            "logit",
+            Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                    (
+                        "clf",
+                        LogisticRegression(
+                            C=1.8,
+                            max_iter=900,
+                            class_weight="balanced",
+                            solver="lbfgs",
+                        ),
+                    ),
+                ]
             ),
-        ]
-    )
+        ),
+        (
+            "hgb",
+            Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                    (
+                        "clf",
+                        HistGradientBoostingClassifier(
+                            learning_rate=0.08,
+                            max_iter=400,
+                            max_depth=3,
+                            min_samples_leaf=80,
+                            l2_regularization=0.4,
+                            random_state=42,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+    ]
 
-    try:
-        pipeline.fit(X_core, y_core)
-    except Exception as err:
-        print(f"Hybrid ML signal skipped: {err}")
-        return
+    evaluated: list[dict[str, Any]] = []
+    for name, pipeline in model_builders:
+        try:
+            pipeline.fit(X_core, y_core)
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={name}) skipped during fit: {err}")
+            continue
 
-    try:
-        val_probs = pipeline.predict_proba(X_val)[:, 1]
-    except Exception as err:
-        print(f"Hybrid ML signal validation inference failed: {err}")
-        return
+        try:
+            val_probs = pipeline.predict_proba(X_val)[:, 1]
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={name}) validation inference failed: {err}")
+            continue
 
-    try:
-        auc = roc_auc_score(y_val, val_probs)
-    except Exception as err:
-        print(f"Hybrid ML signal AUC failed: {err}")
-        return
+        try:
+            auc = roc_auc_score(y_val, val_probs)
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={name}) AUC failed: {err}")
+            continue
 
-    pred_labels = (val_probs >= 0.5).astype(int)
-    acc = accuracy_score(y_val, pred_labels)
+        pred_labels = (val_probs >= 0.5).astype(int)
+        acc = accuracy_score(y_val, pred_labels)
+        evaluated.append(
+            {
+                "name": name,
+                "pipeline": pipeline,
+                "auc": float(auc),
+                "acc": float(acc),
+            }
+        )
 
-    if (not np.isfinite(auc)) or auc < 0.55 or acc < 0.55:
+    if not evaluated:
+        return None
+
+    best_model = max(evaluated, key=lambda item: (item["auc"], item["acc"]))
+    auc = best_model["auc"]
+    acc = best_model["acc"]
+    model_name = best_model["name"]
+
+    min_auc = 0.53
+    min_acc = 0.52
+    if (not np.isfinite(auc)) or auc < min_auc or acc < min_acc:
         safe_auc = float(auc) if np.isfinite(auc) else float("nan")
         print(
             "Hybrid ML signal skipped due to weak validation: "
-            f"auc={safe_auc:.3f}, acc={acc:.3f}, n_val={len(y_val)}"
+            f"h={horizon}, model={model_name}, auc={safe_auc:.3f}, acc={acc:.3f}, n_val={len(y_val)}"
         )
-        return
+        return None
 
     full_train_df = feat_df.iloc[train_idx]
     full_train_y = label_series.iloc[train_idx]
+    best_pipeline = best_model["pipeline"]
 
     try:
-        pipeline.fit(full_train_df, full_train_y)
+        best_pipeline.fit(full_train_df, full_train_y)
     except Exception as err:
-        print(f"Hybrid ML signal refit failed: {err}")
-        return
+        print(f"Hybrid ML signal (h={horizon}, model={model_name}) refit failed: {err}")
+        return None
 
     try:
-        full_probs = pipeline.predict_proba(feat_df)[:, 1]
+        full_probs = best_pipeline.predict_proba(feat_df)[:, 1]
     except Exception as err:
-        print(f"Hybrid ML signal inference failed: {err}")
-        return
+        print(f"Hybrid ML signal (h={horizon}, model={model_name}) inference failed: {err}")
+        return None
 
     lift = max(0.0, float(auc) - 0.5)
-    ml_weight = min(0.6, 0.25 + (lift * 1.6))
-    ml_component = ((full_probs - 0.5) * 2.0).clip(-1.0, 1.0)
-    ml_smoothed = (
-        pd.Series(ml_component, index=df.index)
-        .ewm(span=18, adjust=False)
-        .mean()
-        .clip(-1.0, 1.0)
-    )
+    ml_weight = min(0.65, 0.22 + (lift * 1.8))
+    ml_component = pd.Series(((full_probs - 0.5) * 2.0).clip(-1.0, 1.0), index=df.index)
+    ml_smoothed = ml_component.ewm(span=18, adjust=False).mean().clip(-1.0, 1.0)
 
-    df["score_ml_raw"] = ml_component
-    df["score_ml"] = ml_smoothed
+    return {
+        "horizon": horizon,
+        "model": model_name,
+        "auc": float(auc),
+        "acc": float(acc),
+        "weight": ml_weight,
+        "raw": ml_component,
+        "smoothed": ml_smoothed,
+        "val_size": len(y_val),
+    }
+
+
+def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int, ...] = (3, 6, 12)) -> None:
+    feature_cols = [
+        "score",
+        "trend",
+        "m3",
+        "m20",
+        "volume_bias",
+        "range_score",
+        "ret_3",
+        "ret_20",
+        "volatility",
+        "atr_pct",
+        "volume_z",
+        "ema_ratio",
+        "macd_hist",
+        "price_momentum",
+        "volume_trend",
+    ]
+
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        return
+
     base_score = df["score"].clip(-1.0, 1.0)
-    df["score"] = (ml_weight * ml_smoothed) + ((1.0 - ml_weight) * base_score)
+    best: dict[str, Any] | None = None
+
+    for horizon in horizons:
+        candidate = _fit_ml_candidate(df, train_rows, horizon, feature_cols)
+        if candidate is None:
+            continue
+
+        if best is None:
+            best = candidate
+            continue
+
+        if (candidate["auc"] > best["auc"] + 0.002) or (
+            abs(candidate["auc"] - best["auc"]) <= 0.002 and candidate["acc"] > best["acc"]
+        ):
+            best = candidate
+
+    if best is None:
+        print("Hybrid ML signal skipped: no horizon met validation criteria")
+        return
+
+    df["score_ml_raw"] = best["raw"]
+    df["score_ml"] = best["smoothed"]
+    df["score"] = (best["weight"] * best["smoothed"]) + ((1.0 - best["weight"]) * base_score)
+    print(
+        "Hybrid ML signal applied ("
+        f"h={best['horizon']}, model={best['model']}, auc={best['auc']:.3f}, acc={best['acc']:.3f}, "
+        f"weight={best['weight']:.2f}, n_val={best['val_size']}"
+        ")"
+    )
 
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
