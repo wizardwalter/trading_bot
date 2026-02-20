@@ -240,58 +240,82 @@ def _score_metrics(m: Metrics) -> float:
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
-    candidates = np.arange(0.05, 0.71, 0.01)
+    def evaluate_candidates(candidates: np.ndarray) -> list[tuple[float, Metrics]]:
+        n = len(train_df)
+        fold_start = int(n * 0.30)
+        fold_ends = [int(n * 0.50), int(n * 0.65), int(n * 0.80), n]
 
-    # Walk-forward validation within the training window to reduce threshold overfitting.
-    n = len(train_df)
-    fold_start = int(n * 0.30)
-    fold_ends = [int(n * 0.50), int(n * 0.65), int(n * 0.80), n]
+        scored_local: list[tuple[float, Metrics]] = []
+        for th in candidates:
+            full_m = simulate(train_df, float(th))
 
-    scored: list[tuple[float, Metrics]] = []
-    for th in candidates:
-        full_m = simulate(train_df, th)
+            fold_metrics: list[Metrics] = []
+            prev = fold_start
+            for end in fold_ends:
+                fold = train_df.iloc[prev:end]
+                if len(fold) < 200:
+                    continue
+                fold_metrics.append(simulate(fold, float(th)))
+                prev = end
 
-        fold_metrics: list[Metrics] = []
-        prev = fold_start
-        for end in fold_ends:
-            fold = train_df.iloc[prev:end]
-            if len(fold) < 200:
-                continue
-            fold_metrics.append(simulate(fold, th))
-            prev = end
+            fold_scores = [_score_metrics(m) for m in fold_metrics]
+            if fold_scores:
+                # Slightly overweight more recent folds to better match OOS deployment conditions.
+                base_weights = np.array([1.0, 1.2, 1.5, 1.8], dtype=float)
+                w = base_weights[-len(fold_scores) :]
+                cv_score = float(np.average(fold_scores, weights=w))
+            else:
+                cv_score = -1.0
 
-        fold_scores = [_score_metrics(m) for m in fold_metrics]
-        if fold_scores:
-            # Slightly overweight more recent folds to better match OOS deployment conditions.
-            base_weights = np.array([1.0, 1.2, 1.5, 1.8], dtype=float)
-            w = base_weights[-len(fold_scores) :]
-            cv_score = float(np.average(fold_scores, weights=w))
-        else:
-            cv_score = -1.0
+            # Prefer thresholds that are consistent across folds, not just high average.
+            if fold_metrics:
+                ret_std = float(np.std([m.total_return for m in fold_metrics]))
+                worst_fold_return = float(min(m.total_return for m in fold_metrics))
+                worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
+                recent_fold_return = float(fold_metrics[-1].total_return)
+                stability_penalty = (
+                    (ret_std * 1.8)
+                    + (abs(min(worst_fold_return, 0.0)) * 0.7)
+                    + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
+                    + (abs(min(recent_fold_return, 0.0)) * 0.6)
+                )
+            else:
+                stability_penalty = 0.45
 
-        # Prefer thresholds that are consistent across folds, not just high average.
-        if fold_metrics:
-            ret_std = float(np.std([m.total_return for m in fold_metrics]))
-            worst_fold_return = float(min(m.total_return for m in fold_metrics))
-            worst_fold_dd = float(min(m.max_drawdown for m in fold_metrics))
-            recent_fold_return = float(fold_metrics[-1].total_return)
-            stability_penalty = (
-                (ret_std * 1.8)
-                + (abs(min(worst_fold_return, 0.0)) * 0.7)
-                + (abs(min(worst_fold_dd + 0.15, 0.0)) * 0.3)
-                + (abs(min(recent_fold_return, 0.0)) * 0.6)
-            )
-        else:
-            stability_penalty = 0.45
+            score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty
+            scored_local.append((score, full_m))
 
-        score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty
-        scored.append((score, full_m))
+        return scored_local
+
+    # Stage 1: coarse sweep across a wide range.
+    coarse = np.arange(0.05, 0.71, 0.01)
+    scored = evaluate_candidates(coarse)
+
+    # Stage 2: local refinement around the strongest coarse candidates.
+    top_seed = sorted(scored, key=lambda x: x[0], reverse=True)[:4]
+    centers = [m.threshold for _, m in top_seed]
+    refined_vals: set[float] = set()
+    for c in centers:
+        for th in np.arange(max(0.03, c - 0.03), min(0.80, c + 0.03) + 1e-9, 0.002):
+            refined_vals.add(round(float(th), 3))
+    refined = np.array(sorted(refined_vals), dtype=float)
+    if len(refined) > 0:
+        scored.extend(evaluate_candidates(refined))
+
+    # Keep the best score for each threshold after coarse+refined sweeps.
+    best_by_th: dict[float, tuple[float, Metrics]] = {}
+    for score, m in scored:
+        th = round(m.threshold, 3)
+        prev = best_by_th.get(th)
+        if prev is None or score > prev[0]:
+            best_by_th[th] = (score, m)
+    deduped = list(best_by_th.values())
 
     # Favor thresholds with positive train behavior, acceptable risk, and enough activity.
     # A 5-trade floor keeps the strategy active while allowing higher-quality selective entries.
     viable = [
         (score, m)
-        for score, m in scored
+        for score, m in deduped
         if m.total_return > 0 and m.max_drawdown >= -0.12 and m.trades >= 5
     ]
 
@@ -303,7 +327,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
 
     # Fallback: least-bad threshold by blended return/risk score.
     return max(
-        scored,
+        deduped,
         key=lambda x: (x[0], x[1].total_return, x[1].max_drawdown, x[1].sharpe_like, -x[1].threshold),
     )[1]
 
