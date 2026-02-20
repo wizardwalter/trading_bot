@@ -12,6 +12,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from discord.notify import send_training_update
 
@@ -87,6 +92,7 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Bias toward RSI mean-reversion while preserving trend context for fewer whipsaws.
     out["score"] = 0.35 * trend + 0.15 * m20 + 0.05 * m3 + 0.45 * rsi_comp
+    out["score_raw"] = out["score"]
     out["trend"] = trend
     out["m3"] = m3
     out["m20"] = m20
@@ -352,6 +358,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
         scored_local: list[tuple[float, Metrics]] = []
         for th in candidates:
             full_m = simulate(train_df, float(th))
+            instability_penalty = _neighbor_instability_penalty(train_df, float(th), full_m.total_return)
 
             fold_metrics: list[Metrics] = []
             prev = fold_start
@@ -392,7 +399,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
             else:
                 stability_penalty = 0.45
 
-            score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty
+            score = (_score_metrics(full_m) * 0.40) + (cv_score * 0.60) - stability_penalty - (instability_penalty * 0.75)
             scored_local.append((score, full_m))
 
         return scored_local
@@ -467,6 +474,138 @@ def _build_webhook_metrics(symbol: str, interval: str, period: str, mode: str, t
     return msg
 
 
+def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizon: int = 6) -> None:
+    if len(df) <= horizon or train_rows <= horizon:
+        return
+
+    feature_cols = [
+        "score",
+        "trend",
+        "m3",
+        "m20",
+        "volume_bias",
+        "range_score",
+        "ret_3",
+        "ret_20",
+        "volatility",
+        "atr_pct",
+    ]
+
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        return
+
+    target = df["Close"].pct_change(horizon).shift(-horizon)
+    label = (target > 0).astype(int)
+    valid_mask = label.notna().to_numpy().copy()
+    valid_mask[-horizon:] = False
+
+    train_mask = np.zeros(len(df), dtype=bool)
+    train_mask[:train_rows] = True
+    train_mask &= valid_mask
+
+    train_idx = np.flatnonzero(train_mask)
+    if train_idx.size < 320:
+        return
+
+    val_size = max(int(train_idx.size * 0.2), 120)
+    if val_size >= train_idx.size:
+        return
+
+    core_idx = train_idx[:-val_size]
+    val_idx = train_idx[-val_size:]
+
+    if core_idx.size < 200 or val_idx.size < 80:
+        return
+
+    feat_df = df[feature_cols]
+    label_series = label
+
+    X_core = feat_df.iloc[core_idx]
+    y_core = label_series.iloc[core_idx]
+
+    X_val = feat_df.iloc[val_idx]
+    y_val = label_series.iloc[val_idx]
+
+    if y_core.nunique() < 2 or y_val.nunique() < 2:
+        return
+
+    pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            (
+                "clf",
+                LogisticRegression(
+                    C=1.6,
+                    max_iter=800,
+                    class_weight="balanced",
+                    solver="lbfgs",
+                ),
+            ),
+        ]
+    )
+
+    try:
+        pipeline.fit(X_core, y_core)
+    except Exception as err:
+        print(f"Hybrid ML signal skipped: {err}")
+        return
+
+    try:
+        val_probs = pipeline.predict_proba(X_val)[:, 1]
+    except Exception as err:
+        print(f"Hybrid ML signal validation inference failed: {err}")
+        return
+
+    try:
+        auc = roc_auc_score(y_val, val_probs)
+    except Exception as err:
+        print(f"Hybrid ML signal AUC failed: {err}")
+        return
+
+    pred_labels = (val_probs >= 0.5).astype(int)
+    acc = accuracy_score(y_val, pred_labels)
+
+    if (not np.isfinite(auc)) or auc < 0.55 or acc < 0.55:
+        safe_auc = float(auc) if np.isfinite(auc) else float("nan")
+        print(
+            "Hybrid ML signal skipped due to weak validation: "
+            f"auc={safe_auc:.3f}, acc={acc:.3f}, n_val={len(y_val)}"
+        )
+        return
+
+    full_train_df = feat_df.iloc[train_idx]
+    full_train_y = label_series.iloc[train_idx]
+
+    try:
+        pipeline.fit(full_train_df, full_train_y)
+    except Exception as err:
+        print(f"Hybrid ML signal refit failed: {err}")
+        return
+
+    try:
+        full_probs = pipeline.predict_proba(feat_df)[:, 1]
+    except Exception as err:
+        print(f"Hybrid ML signal inference failed: {err}")
+        return
+
+    lift = max(0.0, float(auc) - 0.5)
+    ml_weight = min(0.6, 0.25 + (lift * 1.6))
+    ml_component = ((full_probs - 0.5) * 2.0).clip(-1.0, 1.0)
+    ml_smoothed = (
+        pd.Series(ml_component, index=df.index)
+        .ewm(span=18, adjust=False)
+        .mean()
+        .clip(-1.0, 1.0)
+    )
+
+    df["score_ml_raw"] = ml_component
+    df["score_ml"] = ml_smoothed
+    base_score = df["score"].clip(-1.0, 1.0)
+    df["score"] = (ml_weight * ml_smoothed) + ((1.0 - ml_weight) * base_score)
+
+
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     raw = download(symbol=symbol, interval=interval, period=period)
     df = features(raw)
@@ -474,6 +613,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
         raise RuntimeError(f"insufficient feature rows for backtest: {len(df)}")
 
     split = int(len(df) * 0.7)
+    _blend_with_ml_signal(df, split)
+
     train_df = df.iloc[:split]
     test_df = df.iloc[split:]
 

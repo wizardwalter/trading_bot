@@ -24,7 +24,7 @@ min_keep = int(os.getenv("BACKUP_MIN_KEEP", "10"))
 retention_days = int(os.getenv("BACKUP_RETENTION_DAYS", "60"))
 cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
-ls = subprocess.run(["rclone", "lsf", base, "--dirs", "--recursive"], capture_output=True, text=True)
+ls = subprocess.run(["rclone", "lsf", base, "--dirs-only", "--recursive"], capture_output=True, text=True)
 if ls.returncode != 0:
     raise SystemExit(ls.stderr.strip() or "rclone lsf failed")
 
