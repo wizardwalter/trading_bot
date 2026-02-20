@@ -332,6 +332,31 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
     )[1]
 
 
+def _fmt_pct(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+        if not np.isfinite(v):
+            return "n/a"
+        return f"{v:.2%}"
+    except Exception:
+        return "n/a"
+
+
+def _build_webhook_metrics(symbol: str, interval: str, period: str, mode: str, train_return: float | None, test_return: float | None, test_win_rate: float | None, test_max_drawdown: float | None, error: str | None = None) -> str:
+    msg = (
+        f"{symbol} {interval} {period} {mode} | "
+        f"train_return={_fmt_pct(train_return)} | "
+        f"test_return={_fmt_pct(test_return)} | "
+        f"test_win_rate={_fmt_pct(test_win_rate)} | "
+        f"test_max_drawdown={_fmt_pct(test_max_drawdown)}"
+    )
+    if error:
+        msg += f" | error={error[:120]}"
+    return msg
+
+
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     raw = download(symbol=symbol, interval=interval, period=period)
     df = features(raw)
@@ -362,12 +387,15 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(f"\nSaved: {out_file}")
 
     mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
-    webhook_msg = (
-        f"{symbol} {interval} {period} {mode} | "
-        f"train_return={best.total_return:.2%} | "
-        f"test_return={test.total_return:.2%} | "
-        f"test_win_rate={test.win_rate:.1%} | "
-        f"test_max_drawdown={test.max_drawdown:.2%}"
+    webhook_msg = _build_webhook_metrics(
+        symbol=symbol,
+        interval=interval,
+        period=period,
+        mode=mode,
+        train_return=best.total_return,
+        test_return=test.total_return,
+        test_win_rate=test.win_rate,
+        test_max_drawdown=test.max_drawdown,
     )
     print(f"Webhook metrics: {webhook_msg}")
     try:
@@ -384,10 +412,16 @@ if __name__ == "__main__":
         run()
     except Exception as e:
         # Ensure each training run still emits a concise metrics update, even on failure.
-        err_msg = (
-            "BTC-USD 5m 60d failed | "
-            "train_return=n/a | test_return=n/a | test_win_rate=n/a | test_max_drawdown=n/a | "
-            f"error={str(e)[:120]}"
+        err_msg = _build_webhook_metrics(
+            symbol="BTC-USD",
+            interval="5m",
+            period="60d",
+            mode="failed",
+            train_return=None,
+            test_return=None,
+            test_win_rate=None,
+            test_max_drawdown=None,
+            error=str(e),
         )
         print(f"Webhook metrics: {err_msg}")
         try:
