@@ -356,4 +356,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception as e:
+        # Ensure each training run still emits a concise metrics update, even on failure.
+        err_msg = (
+            "BTC-USD 5m 60d failed | "
+            "train_return=n/a | test_return=n/a | test_win_rate=n/a | test_max_drawdown=n/a | "
+            f"error={str(e)[:120]}"
+        )
+        print(f"Webhook metrics: {err_msg}")
+        try:
+            send_training_update(err_msg)
+        except Exception:
+            pass
+        raise
