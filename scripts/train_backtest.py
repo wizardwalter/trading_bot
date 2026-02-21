@@ -764,12 +764,15 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
         pred_labels = (preds >= 0.5).astype(int)
         acc = accuracy_score(y_val[sequence_length:], pred_labels)
 
+        trained_model = trained_model.to("cpu")
         evaluated.append(
             {
                 "name": "neural_sequence",
                 "pipeline": trained_model,
                 "auc": float(auc),
                 "acc": float(acc),
+                "sequence_length": sequence_length,
+                "device": "cpu",
             }
         )
     except Exception as err:
@@ -798,18 +801,36 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
     full_train_df = feat_df.iloc[train_idx]
     full_train_y = label_series.iloc[train_idx]
     best_pipeline = best_model["pipeline"]
+    model_name = best_model["name"]
 
-    try:
-        best_pipeline.fit(full_train_df, full_train_y)
-    except Exception as err:
-        print(f"Hybrid ML signal (h={horizon}, model={model_name}) refit failed: {err}")
-        return None
+    if model_name == "neural_sequence":
+        sequence_length = int(best_model.get("sequence_length", 12))
+        device = best_model.get("device", "cpu")
+        try:
+            full_probs = np.full(len(df), 0.5, dtype=float)
+            neural_preds = neural_inference(
+                best_pipeline,
+                feat_df.values,
+                sequence_length=sequence_length,
+                device=device,
+            )
+            if len(neural_preds) > 0:
+                full_probs[sequence_length:] = neural_preds
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={model_name}) inference failed: {err}")
+            return None
+    else:
+        try:
+            best_pipeline.fit(full_train_df, full_train_y)
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={model_name}) refit failed: {err}")
+            return None
 
-    try:
-        full_probs = best_pipeline.predict_proba(feat_df)[:, 1]
-    except Exception as err:
-        print(f"Hybrid ML signal (h={horizon}, model={model_name}) inference failed: {err}")
-        return None
+        try:
+            full_probs = best_pipeline.predict_proba(feat_df)[:, 1]
+        except Exception as err:
+            print(f"Hybrid ML signal (h={horizon}, model={model_name}) inference failed: {err}")
+            return None
 
     lift = max(0.0, float(auc) - 0.5)
     ml_weight = min(0.65, 0.22 + (lift * 1.8))
@@ -928,22 +949,70 @@ from ml.model_orchestrator import ModelOrchestrator
 
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     raw = download(symbol=symbol, interval=interval, period=period)
-    df = features(raw)
-    if len(df) < 200:
-        raise RuntimeError(f"insufficient feature rows for backtest: {len(df)}")
+    baseline_df = features(raw)
+    if len(baseline_df) < 200:
+        raise RuntimeError(f"insufficient feature rows for backtest: {len(baseline_df)}")
 
     orchestrator = ModelOrchestrator()
 
-    split = int(len(df) * 0.7)
-    _blend_with_ml_signal(df, split)
+    split = int(len(baseline_df) * 0.7)
 
-    train_df = df.iloc[:split]
-    test_df = df.iloc[split:]
+    variant_candidates: list[tuple[str, pd.DataFrame]] = [("baseline", baseline_df.copy())]
+
+    ml_df = baseline_df.copy()
+    _blend_with_ml_signal(ml_df, split)
+    ml_applied = "score_ml" in ml_df.columns
+    if ml_applied:
+        variant_candidates.append(("ml_blend", ml_df))
 
     start_time = time.time()
-    best = pick_best(train_df)
-    test = simulate(test_df, best.threshold)
+    variant_results: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
+    for variant_name, variant_df in variant_candidates:
+        train_df_variant = variant_df.iloc[:split]
+        test_df_variant = variant_df.iloc[split:]
+        best_variant = pick_best(train_df_variant)
+        test_variant = simulate(test_df_variant, best_variant.threshold)
+        variant_results.append((variant_name, variant_df, best_variant, test_variant))
     elapsed_s = time.time() - start_time
+
+    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float]:
+        _, _, _, test_metrics = item
+        return (
+            test_metrics.total_return,
+            -abs(test_metrics.max_drawdown),
+            test_metrics.win_rate,
+        )
+
+    selected_variant = max(variant_results, key=_variant_key)
+    selected_name, selected_df, best, test = selected_variant
+
+    baseline_entry = next(item for item in variant_results if item[0] == "baseline")
+    _, _, baseline_best, baseline_test = baseline_entry
+
+    improvement = test.total_return - baseline_test.total_return
+    drawdown_delta = test.max_drawdown - baseline_test.max_drawdown
+
+    variants_payload = {
+        name: {
+            "train": asdict(train_metrics),
+            "test": asdict(test_metrics),
+        }
+        for name, _, train_metrics, test_metrics in variant_results
+    }
+
+    summary_lines = ["Variant comparison:"]
+    for name, _, train_metrics, test_metrics in variant_results:
+        marker = "*" if name == selected_name else "-"
+        summary_lines.append(
+            f" {marker} {name}: train_ret={train_metrics.total_return:.2%}, "
+            f"test_ret={test_metrics.total_return:.2%}, "
+            f"test_dd={test_metrics.max_drawdown:.2%}, trades={test_metrics.trades}, "
+            f"threshold={train_metrics.threshold:.3f}"
+        )
+    print("\n".join(summary_lines))
+
+    train_df = selected_df.iloc[:split]
+    test_df = selected_df.iloc[split:]
 
     # Check for champion promotion
     champion_model, champion_metrics = orchestrator.get_champion()
@@ -958,12 +1027,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
         "symbol": symbol,
         "interval": interval,
         "period": period,
-        "rows": len(df),
+        "rows": len(selected_df),
         "train_rows": len(train_df),
         "test_rows": len(test_df),
         "best_train": asdict(best),
         "test": asdict(test),
         "elapsed_time_s": elapsed_s,
+        "variant": selected_name,
+        "variants": variants_payload,
+        "variant_improvement": {
+            "test_return_delta_vs_baseline": improvement,
+            "test_max_drawdown_delta_vs_baseline": drawdown_delta,
+        },
     }
 
     out_file = OUT_DIR / "latest.json"
@@ -972,12 +1047,23 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(f"\nSaved: {out_file}")
 
     mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
+    if selected_name == "baseline" and ml_applied:
+        variant_note = "baseline (ML blend rejected)"
+    elif selected_name == "ml_blend":
+        variant_note = (
+            f"ml_blend (Δ test return vs baseline: {improvement:+.2%}, "
+            f"Δ max DD: {drawdown_delta:+.2%})"
+        )
+    else:
+        variant_note = selected_name
+
     detailed_msg = (
         f"\n🏁 Training iteration completed in {elapsed_s:.1f}s. Mode: {mode}"
         f"\nSymbol: {symbol} | Interval: {interval} | Period: {period}"
         f"\nTrain return: {best.total_return:.2%} | Test return: {test.total_return:.2%}"
         f"\nTest win rate: {test.win_rate:.2%} | Max drawdown: {test.max_drawdown:.2%}"
         f"\nThreshold: {best.threshold:.3f} | Trades: {test.trades}"
+        f"\nVariant: {variant_note}"
         f"\nChampion: {champion_model}"
     )
     print(detailed_msg)
