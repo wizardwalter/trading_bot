@@ -5,3 +5,5 @@ POSTGRES.md
 /logs
 data/backtests/*.json
 data/backups/
+best_neural_model.pth
+data/model_state.json

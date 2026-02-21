@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import torch
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -756,7 +757,7 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
             neural_model, train_loader, val_loader, epochs=10, lr=0.001, device=device
         )
 
-        val_features = feat_df.iloc[val_idx:].values
+        val_features = feat_df.iloc[val_idx].values
         preds = neural_inference(trained_model, val_features, sequence_length=sequence_length, device=device)
 
         auc = roc_auc_score(y_val[sequence_length:], preds)
@@ -939,8 +940,10 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     train_df = df.iloc[:split]
     test_df = df.iloc[split:]
 
+    start_time = time.time()
     best = pick_best(train_df)
     test = simulate(test_df, best.threshold)
+    elapsed_s = time.time() - start_time
 
     # Check for champion promotion
     champion_model, champion_metrics = orchestrator.get_champion()
@@ -960,6 +963,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
         "test_rows": len(test_df),
         "best_train": asdict(best),
         "test": asdict(test),
+        "elapsed_time_s": elapsed_s,
     }
 
     out_file = OUT_DIR / "latest.json"
@@ -968,6 +972,16 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(f"\nSaved: {out_file}")
 
     mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
+    detailed_msg = (
+        f"\n🏁 Training iteration completed in {elapsed_s:.1f}s. Mode: {mode}"
+        f"\nSymbol: {symbol} | Interval: {interval} | Period: {period}"
+        f"\nTrain return: {best.total_return:.2%} | Test return: {test.total_return:.2%}"
+        f"\nTest win rate: {test.win_rate:.2%} | Max drawdown: {test.max_drawdown:.2%}"
+        f"\nThreshold: {best.threshold:.3f} | Trades: {test.trades}"
+        f"\nChampion: {champion_model}"
+    )
+    print(detailed_msg)
+
     webhook_msg = _build_webhook_metrics(
         symbol=symbol,
         interval=interval,

@@ -93,5 +93,4 @@ def neural_inference(model: NeuralSequenceModel, features: np.ndarray, sequence_
             preds.append(pred)
 
     preds_np = np.array(preds)
-    preds_clipped = np.clip(preds_np * 2 - 1, -1, 1)  # Scale to [-1, 1]
-    return preds_clipped
+    return np.clip(preds_np, 0.0, 1.0)
