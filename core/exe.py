@@ -57,9 +57,21 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
         print(f"[{datetime.utcnow().isoformat()}] ⚠️ Unable to fetch account snapshot: {e}")
         return
 
+    if account.get("_stale"):
+        age = account.get("_cache_age_seconds")
+        age_desc = f"{age:.0f}s" if isinstance(age, (int, float)) else "unknown"
+        warning = account.get("_cache_warning")
+        warning_suffix = f" | {warning}" if warning else ""
+        print(
+            f"[{datetime.utcnow().isoformat()}] ⚠️ Using cached Alpaca account snapshot age={age_desc}{warning_suffix}"
+        )
+
     start_equity = float(account.get("equity", 0.0))
     last_account_snapshot = account
-    last_account_refresh_ts = time.time()
+    if account.get("_stale"):
+        last_account_refresh_ts = time.time() - ACCOUNT_REFRESH_SECONDS - 1
+    else:
+        last_account_refresh_ts = time.time()
 
     tickers = get_all_tickers()
     if not tickers:
@@ -79,9 +91,20 @@ def run_bot(paper_mode: bool = True, execute_orders: bool = False):
 
             if need_refresh:
                 try:
-                    account_now = broker.get_account()
-                    last_account_snapshot = account_now
-                    last_account_refresh_ts = now_ts
+                    account_candidate = broker.get_account()
+                    if account_candidate.get("_stale"):
+                        age = account_candidate.get("_cache_age_seconds")
+                        age_desc = f"{age:.0f}s" if isinstance(age, (int, float)) else "unknown"
+                        warning = account_candidate.get("_cache_warning")
+                        warning_suffix = f" | {warning}" if warning else ""
+                        print(
+                            f"[{datetime.utcnow().isoformat()}] ⚠️ Using cached Alpaca account snapshot age={age_desc} for {ticker}{warning_suffix}"
+                        )
+                        last_account_refresh_ts = now_ts - (ACCOUNT_REFRESH_SECONDS * 0.5)
+                    else:
+                        last_account_refresh_ts = now_ts
+                    last_account_snapshot = account_candidate
+                    account_now = account_candidate
                 except Exception as e:
                     account_now = last_account_snapshot
                     print(

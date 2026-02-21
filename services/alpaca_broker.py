@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -36,6 +39,10 @@ class AlpacaBroker:
                 "Content-Type": "application/json",
             }
         )
+        cache_path = os.getenv("ALPACA_ACCOUNT_CACHE", "data/cache/alpaca_account.json")
+        self._account_cache_path = Path(cache_path) if cache_path else None
+        self._account_cache_max_age = max(int(os.getenv("ALPACA_ACCOUNT_CACHE_MAX_AGE_SECONDS", "420")), 0)
+        self._allow_stale_account = os.getenv("ALPACA_ALLOW_STALE_ACCOUNT", "1") == "1"
 
     def _request(self, method: str, path: str, timeout: int | tuple[int, int] = 15, retries: int = 4, **kwargs):
         last_err: Exception | None = None
@@ -73,10 +80,61 @@ class AlpacaBroker:
 
         raise RuntimeError(f"Alpaca {method} {path} failed after {total_retries} attempts: {last_err}")
 
+    def _write_account_cache(self, payload: dict) -> None:
+        if not self._account_cache_path:
+            return
+        try:
+            to_store = dict(payload)
+            to_store["_cached_at"] = datetime.now(timezone.utc).isoformat()
+            self._account_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._account_cache_path.write_text(json.dumps(to_store, indent=2, sort_keys=True))
+        except Exception:
+            # Cache best-effort only.
+            return
+
+    def _load_account_cache(self) -> dict | None:
+        if not self._allow_stale_account or not self._account_cache_path or not self._account_cache_path.exists():
+            return None
+        try:
+            cached_payload = json.loads(self._account_cache_path.read_text())
+        except Exception:
+            return None
+
+        try:
+            cached_at_raw = cached_payload.get("_cached_at")
+            if cached_at_raw:
+                cached_at = datetime.fromisoformat(cached_at_raw)
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+            else:
+                cached_at = datetime.fromtimestamp(self._account_cache_path.stat().st_mtime, tz=timezone.utc)
+        except Exception:
+            cached_at = datetime.fromtimestamp(self._account_cache_path.stat().st_mtime, tz=timezone.utc)
+
+        age_seconds = max((datetime.now(timezone.utc) - cached_at).total_seconds(), 0.0)
+        if self._account_cache_max_age and age_seconds > self._account_cache_max_age:
+            return None
+
+        payload = dict(cached_payload)
+        payload["_cache_age_seconds"] = age_seconds
+        payload["_stale"] = True
+        return payload
+
     def get_account(self) -> dict:
-        r = self._request("GET", "/v2/account")
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = self._request("GET", "/v2/account")
+            r.raise_for_status()
+            payload = r.json()
+            self._write_account_cache(payload)
+            payload["_stale"] = False
+            payload["_cache_age_seconds"] = 0.0
+            return payload
+        except Exception as exc:
+            cached = self._load_account_cache()
+            if cached:
+                cached["_cache_warning"] = f"Alpaca account fallback after error: {exc}"
+                return cached
+            raise RuntimeError(f"Alpaca account fetch failed with no cache available: {exc}") from exc
 
     def get_positions(self) -> list[dict]:
         r = self._request("GET", "/v2/positions")

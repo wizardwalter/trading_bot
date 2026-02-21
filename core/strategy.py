@@ -273,10 +273,27 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
 
 
 def position_size(equity: float, price: float, volatility: float, max_risk_per_trade: float = 0.01) -> float:
-    risk_budget = max(equity, 0.0) * max_risk_per_trade
-    risk_per_unit = price * max(volatility, 0.005)
+    vol_clamped = min(max(float(volatility), 0.0045), 0.06)
+
+    if vol_clamped >= 0.030:
+        risk_factor = 0.25
+    elif vol_clamped >= 0.022:
+        risk_factor = 0.40
+    elif vol_clamped >= 0.017:
+        risk_factor = 0.60
+    elif vol_clamped <= 0.007:
+        risk_factor = 1.15
+    else:
+        risk_factor = 1.0
+
+    dynamic_risk = max_risk_per_trade * risk_factor
+    dynamic_risk = min(max(dynamic_risk, max_risk_per_trade * 0.25), max_risk_per_trade * 1.20)
+
+    risk_budget = max(equity, 0.0) * dynamic_risk
+    risk_per_unit = price * max(vol_clamped, 0.0055)
     if risk_per_unit <= 0:
         return 0.0
+
     qty = risk_budget / risk_per_unit
     return max(float(qty), 0.0)
 
