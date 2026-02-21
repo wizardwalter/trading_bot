@@ -53,16 +53,44 @@ CREATE TABLE IF NOT EXISTS tickers (
 ```
  
 ### Step 7: Run the Bot
-With your virtual environment activated:
+With your virtual environment activated you can trigger a single trading pass:
 ```bash
-python main.py
+python cli/main.py
+```
+Or launch the continuous loop with optional live execution harness:
+```bash
+python cli/main.py --loop --interval 60 --status-every 5 --execute
 ```
  
 ### Step 8: Monitor CLI & Discord
-The bot logs actions to the CLI and sends notifications to your Discord server.
+The bot logs actions to the CLI and sends notifications to your Discord server. Tail `logs/autonomous.log` when running via the helper scripts below.
+
+### Step 9: Autonomous Trading Loop (optional)
+Wrapper scripts live under `scripts/` to keep the bot running in the background:
+```bash
+./scripts/start_autonomous.sh      # start loop (writes logs/autonomous.log)
+./scripts/status_autonomous.sh     # tail recent output & show PID
+./scripts/stop_autonomous.sh       # shut it down
+```
  
+### Step 10: Autonomous Training Loop (optional)
+Use the training daemon to keep models fresh without supervision:
+```bash
+./scripts/start_training.sh        # starts services/training_daemon.py
+./scripts/status_training.sh       # tail logs/training_daemon.log
+./scripts/stop_training.sh         # stop the daemon
+```
+Environment overrides (set in `.env` or inline) include `TRAINING_INTERVAL_MINUTES`, `TRAINING_JITTER_MINUTES`, `TRAINING_SYMBOL`, `TRAINING_BAR_INTERVAL`, and `TRAINING_PERIOD`.
+
+### Progress Ledger (Crash Recovery)
+Both the trading loop and training daemon now emit structured breadcrumbs to `logs/progress.jsonl`, with the latest event mirrored to `logs/progress_latest.json`. Tail the ledger anytime you need to know what the bot was doing before a restart or crash:
+```bash
+tail -f logs/progress.jsonl
+```
+`logs/progress_state.json` is reserved for the most recent high-level snapshot. Feel free to extend it with any extra metadata your supervisor stack might need.
+
 ---
-💡 You can use `cron` or `launchd` to schedule the bot to run between market hours (9:30AM – 4:00PM EST).
+💡 You can use `cron` or `launchd` to schedule the bot to run between market hours (9:30AM – 4:00PM EST). The daemon scripts can also be dropped into systemd services or supervisor configs for hands-off ops.
  
 Happy trading 🚀
 

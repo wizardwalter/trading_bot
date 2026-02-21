@@ -26,6 +26,11 @@ from discord.notify import send_training_update
 OUT_DIR = Path("data/backtests")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+TRAINING_MODE = (os.getenv("TRAINING_MODE") or "auto").strip().lower()
+if TRAINING_MODE not in {"auto", "classic", "neural"}:
+    TRAINING_MODE = "auto"
+TRAINING_LABEL = (os.getenv("TRAINING_LABEL") or os.getenv("TRAINING_VARIANT") or "").strip()
+
 
 def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", retries: int = 4) -> pd.DataFrame:
     last_err: Exception | None = None
@@ -947,7 +952,11 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
 
 from ml.model_orchestrator import ModelOrchestrator
 
-def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
+def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", training_mode: str | None = None):
+    mode_setting = (training_mode or TRAINING_MODE or "auto").strip().lower()
+    if mode_setting not in {"auto", "classic", "neural"}:
+        mode_setting = "auto"
+
     raw = download(symbol=symbol, interval=interval, period=period)
     baseline_df = features(raw)
     if len(baseline_df) < 200:
@@ -957,13 +966,28 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
 
     split = int(len(baseline_df) * 0.7)
 
-    variant_candidates: list[tuple[str, pd.DataFrame]] = [("baseline", baseline_df.copy())]
+    baseline_variant_name = "classic_baseline" if mode_setting == "classic" else "baseline"
+    variant_candidates: list[tuple[str, pd.DataFrame]] = [(baseline_variant_name, baseline_df.copy())]
 
-    ml_df = baseline_df.copy()
-    _blend_with_ml_signal(ml_df, split)
-    ml_applied = "score_ml" in ml_df.columns
-    if ml_applied:
-        variant_candidates.append(("ml_blend", ml_df))
+    ml_applied = False
+    if mode_setting != "classic":
+        ml_df = baseline_df.copy()
+        _blend_with_ml_signal(ml_df, split)
+        ml_applied = "score_ml" in ml_df.columns
+        if ml_applied:
+            blend_name = "neural_blend" if mode_setting == "neural" else "ml_blend"
+            variant_candidates.append((blend_name, ml_df))
+            ml_signal_df = baseline_df.copy()
+            ml_signal_df["score"] = ml_df["score_ml"].copy()
+            ml_signal_df["score_ml"] = ml_df["score_ml"].copy()
+            if "score_ml_raw" in ml_df.columns:
+                ml_signal_df["score_ml_raw"] = ml_df["score_ml_raw"].copy()
+            signal_name = "neural_signal_only" if mode_setting == "neural" else "ml_signal_only"
+            variant_candidates.append((signal_name, ml_signal_df))
+        elif mode_setting == "neural":
+            raise RuntimeError(
+                "Neural training mode requires a validated ML signal, but blend generation failed."
+            )
 
     start_time = time.time()
     variant_results: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
@@ -983,10 +1007,29 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
             test_metrics.win_rate,
         )
 
-    selected_variant = max(variant_results, key=_variant_key)
+    if not variant_results:
+        raise RuntimeError("No training variants were evaluated")
+
+    if mode_setting == "classic":
+        selected_variant = next(item for item in variant_results if item[0] == baseline_variant_name)
+    elif mode_setting == "neural":
+        neural_variants = [item for item in variant_results if item[0] != baseline_variant_name]
+        if not neural_variants:
+            raise RuntimeError("Neural training mode did not produce any ML-backed variants")
+        selected_variant = max(neural_variants, key=_variant_key)
+    else:
+        selected_variant = max(variant_results, key=_variant_key)
+
     selected_name, selected_df, best, test = selected_variant
 
-    baseline_entry = next(item for item in variant_results if item[0] == "baseline")
+    if mode_setting == "classic":
+        resolved_profile = "classic"
+    elif mode_setting == "neural":
+        resolved_profile = "neural"
+    else:
+        resolved_profile = "neural" if selected_name != baseline_variant_name else "classic"
+
+    baseline_entry = next(item for item in variant_results if item[0] == baseline_variant_name)
     _, _, baseline_best, baseline_test = baseline_entry
 
     improvement = test.total_return - baseline_test.total_return
@@ -1039,6 +1082,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
             "test_return_delta_vs_baseline": improvement,
             "test_max_drawdown_delta_vs_baseline": drawdown_delta,
         },
+        "training_profile": resolved_profile,
+        "training_profile_requested": mode_setting,
+        "training_label": TRAINING_LABEL or resolved_profile,
     }
 
     out_file = OUT_DIR / "latest.json"
@@ -1047,24 +1093,31 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
     print(f"\nSaved: {out_file}")
 
     mode = "defensive-standby" if (best.trades == 0 or test.trades == 0) else "active-trading"
-    if selected_name == "baseline" and ml_applied:
-        variant_note = "baseline (ML blend rejected)"
-    elif selected_name == "ml_blend":
+    if selected_name == baseline_variant_name:
+        if ml_applied and mode_setting != "classic":
+            variant_note = f"{selected_name} (ML blend rejected)"
+        else:
+            variant_note = selected_name
+    elif selected_name in {"ml_blend", "neural_blend", "ml_signal_only", "neural_signal_only"}:
         variant_note = (
-            f"ml_blend (Δ test return vs baseline: {improvement:+.2%}, "
+            f"{selected_name} (Δ test return vs {baseline_variant_name}: {improvement:+.2%}, "
             f"Δ max DD: {drawdown_delta:+.2%})"
         )
     else:
         variant_note = selected_name
 
+    label_used = TRAINING_LABEL or resolved_profile
+    label_line = f"\nLabel: {label_used}"
     detailed_msg = (
         f"\n🏁 Training iteration completed in {elapsed_s:.1f}s. Mode: {mode}"
+        f"\nTraining profile: {resolved_profile} (requested: {mode_setting})"
         f"\nSymbol: {symbol} | Interval: {interval} | Period: {period}"
         f"\nTrain return: {best.total_return:.2%} | Test return: {test.total_return:.2%}"
         f"\nTest win rate: {test.win_rate:.2%} | Max drawdown: {test.max_drawdown:.2%}"
         f"\nThreshold: {best.threshold:.3f} | Trades: {test.trades}"
         f"\nVariant: {variant_note}"
         f"\nChampion: {champion_model}"
+        f"{label_line}"
     )
     print(detailed_msg)
 
@@ -1078,9 +1131,10 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d"):
         test_win_rate=test.win_rate,
         test_max_drawdown=test.max_drawdown,
     )
+    webhook_msg = f"{webhook_msg} | training_profile={resolved_profile} | variant={selected_name}"
     print(f"Webhook metrics: {webhook_msg}")
     try:
-        delivered = send_training_update(webhook_msg)
+        delivered = send_training_update(webhook_msg, label=label_used)
         if not delivered:
             print("Webhook update failed: no webhook configured or delivery failed after retries")
     except Exception as e:
@@ -1104,9 +1158,12 @@ if __name__ == "__main__":
             test_max_drawdown=None,
             error=str(e),
         )
+        requested_profile = TRAINING_MODE or "auto"
+        label_used = TRAINING_LABEL or requested_profile
+        err_msg = f"{err_msg} | training_profile={requested_profile}"
         print(f"Webhook metrics: {err_msg}")
         try:
-            send_training_update(err_msg)
+            send_training_update(err_msg, label=label_used)
         except Exception:
             pass
         raise

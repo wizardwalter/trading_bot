@@ -11,6 +11,14 @@ load_dotenv(ROOT / ".env")
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 TRAINING_WEBHOOK_URL = os.getenv("TRAINING_WEBHOOK_URL")
+TRAINING_LABEL = (os.getenv("TRAINING_LABEL") or os.getenv("TRAINING_VARIANT") or "").strip()
+
+
+def _format_label(label: str | None) -> str:
+    label = (label or "").strip()
+    if not label:
+        return ""
+    return label.upper()
 
 
 def _send_to(url: str | None, content: str):
@@ -51,6 +59,9 @@ def send_status_update(message: str):
     _send(f"📊 {message}")
 
 
-def send_training_update(message: str) -> bool:
+def send_training_update(message: str, label: str | None = None) -> bool:
+    prefix = _format_label(label if label is not None else TRAINING_LABEL)
+    if prefix:
+        message = f"[{prefix}] {message}"
     # Prefer dedicated training channel; fallback to default webhook if unset.
     return _send_to(TRAINING_WEBHOOK_URL or DISCORD_WEBHOOK_URL, f"🧠 {message}")
