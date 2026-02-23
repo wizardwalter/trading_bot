@@ -43,6 +43,9 @@ class AlpacaBroker:
         self._account_cache_path = Path(cache_path) if cache_path else None
         self._account_cache_max_age = max(int(os.getenv("ALPACA_ACCOUNT_CACHE_MAX_AGE_SECONDS", "420")), 0)
         self._allow_stale_account = os.getenv("ALPACA_ALLOW_STALE_ACCOUNT", "1") == "1"
+        self._allow_synth_account = os.getenv("ALPACA_ALLOW_SYNTH_ACCOUNT", "0") == "1"
+        self._synth_bp_multiplier = max(float(os.getenv("ALPACA_SYNTH_BP_MULT", "1.4")), 1.0)
+        self._synth_equity = os.getenv("ALPACA_SYNTH_EQUITY")
 
     def _request(self, method: str, path: str, timeout: int | tuple[int, int] = 15, retries: int = 4, **kwargs):
         last_err: Exception | None = None
@@ -120,6 +123,31 @@ class AlpacaBroker:
         payload["_stale"] = True
         return payload
 
+    def _synthetic_account_payload(self, error: Exception | str | None = None) -> dict | None:
+        if not self._allow_synth_account:
+            return None
+        try:
+            base_equity = float(self._synth_equity or os.getenv("PAPER_STARTING_CASH", "100000"))
+        except Exception:
+            base_equity = 100000.0
+        bp = base_equity * self._synth_bp_multiplier
+        warning = "Synthetic Alpaca account snapshot"
+        if error:
+            warning = f"{warning} ({error})"
+        return {
+            "equity": base_equity,
+            "cash": base_equity,
+            "buying_power": bp,
+            "long_market_value": 0.0,
+            "short_market_value": 0.0,
+            "portfolio_value": base_equity,
+            "status": "SYNTHETIC",
+            "_stale": True,
+            "_cache_age_seconds": float("inf"),
+            "_cache_warning": warning,
+            "_synthetic": True,
+        }
+
     def get_account(self) -> dict:
         try:
             r = self._request("GET", "/v2/account")
@@ -134,6 +162,9 @@ class AlpacaBroker:
             if cached:
                 cached["_cache_warning"] = f"Alpaca account fallback after error: {exc}"
                 return cached
+            synth = self._synthetic_account_payload(exc)
+            if synth:
+                return synth
             raise RuntimeError(f"Alpaca account fetch failed with no cache available: {exc}") from exc
 
     def get_positions(self) -> list[dict]:

@@ -73,6 +73,8 @@ def _features(df: pd.DataFrame) -> pd.DataFrame:
     out["ret_20"] = out["Close"].pct_change(20)
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["volatility"] = out["hl_spread"].rolling(20).mean()
+    out["range_high"] = out["Close"].rolling(48, min_periods=30).max()
+    out["range_low"] = out["Close"].rolling(48, min_periods=30).min()
 
     return out.dropna()
 
@@ -169,6 +171,10 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
     ret_3 = float(row["ret_3"])
     ret_20 = float(row["ret_20"])
     vol = max(float(row["volatility"]), 0.002)
+    range_high = float(row["range_high"])
+    range_low = float(row["range_low"])
+    range_width = max(range_high - range_low, max(price * 0.0005, 1e-6))
+    range_pos = max(min((price - range_low) / range_width, 1.2), -0.2)
 
     trend_component = (ema_fast - ema_slow) / price
     trend_component = max(min(trend_component * 220, 1.0), -1.0)
@@ -182,12 +188,16 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
 
     momentum_component = max(min(ret_20 * 25, 1.0), -1.0)
     short_momentum_component = max(min(ret_3 * 35, 1.0), -1.0)
+    range_drift_component = max(min(((range_pos - 0.5) * 1.8), 1.0), -1.0)
+    breakout_component = max(min(((price - range_high) / range_width) * 2.0, 1.0), -1.0)
 
     score = (
-        (0.44 * trend_component)
-        + (0.22 * momentum_component)
-        + (0.20 * short_momentum_component)
-        + (0.14 * rsi_component)
+        (0.40 * trend_component)
+        + (0.20 * momentum_component)
+        + (0.18 * short_momentum_component)
+        + (0.12 * rsi_component)
+        + (0.06 * range_drift_component)
+        + (0.04 * breakout_component)
     )
 
     # Dynamic thresholds: per-symbol baseline + volatility penalty.
@@ -225,14 +235,26 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
         and trend_component > -0.30
     )
 
+    breakout_ready = price >= range_high * 0.998
+    breakdown_risk = price <= range_low * 1.002
+    compression_regime = (range_width / price) < 0.012
+    range_stop_trigger = has_position and (range_pos < 0.18 and short_momentum_component < -0.05)
+
     if (
         (score > buy_threshold or oversold_rebound or extreme_oversold_reversal)
         and not overbought_exhaustion
         and (not risk_off_regime or allow_countertrend_reversal)
         and (bullish_alignment or oversold_rebound or extreme_oversold_reversal)
+        and (breakout_ready or range_pos > 0.45 or oversold_rebound or extreme_oversold_reversal)
     ):
         action = "buy"
-    elif overbought_exit or (score < sell_threshold and bearish_confirmation) or risk_off_regime:
+    elif (
+        overbought_exit
+        or (score < sell_threshold and bearish_confirmation)
+        or risk_off_regime
+        or range_stop_trigger
+        or (has_position and breakdown_risk and short_momentum_component < -0.02)
+    ):
         action = "sell" if has_position else "hold"
     else:
         action = "hold"
@@ -241,6 +263,12 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
     # explicit risk-off exits (sell threshold / overbought exit).
     if action == "buy" and abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
         action = "hold"
+
+    if action == "buy" and not (oversold_rebound or extreme_oversold_reversal):
+        if range_pos < 0.20 or (compression_regime and not breakout_ready and short_momentum_component < 0.04):
+            action = "hold"
+        if range_pos > 0.85 and short_momentum_component < 0.08 and not breakout_ready:
+            action = "hold"
 
     base_confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
     setup_confidence_boost = 0.0
@@ -258,7 +286,7 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
     reason = (
         f"trend={trend_component:+.2f}, momentum20={momentum_component:+.2f}, "
         f"momentum3={short_momentum_component:+.2f}, rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
-        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], conf={confidence:.2f}, age_s={latest_age_s:.0f}"
+        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], rng={range_pos:.2f}, conf={confidence:.2f}, age_s={latest_age_s:.0f}"
     )
 
     return Signal(
