@@ -1061,10 +1061,22 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     champion_model, champion_metrics = orchestrator.get_champion()
     challenger_metrics = asdict(test)
     challenger_metrics["threshold"] = best.threshold
+    challenger_metrics["variant"] = selected_name
+    challenger_metrics["training_profile"] = resolved_profile
 
+    promoted = False
+    candidate_model_name = f"{resolved_profile}:{selected_name}"
     if orchestrator.should_promote(challenger_metrics):
-        orchestrator.promote("latest_model", challenger_metrics)
-        print("[ORCHESTRATION] Promoted new champion model based on improved performance.")
+        orchestrator.promote(candidate_model_name, challenger_metrics)
+        promoted = True
+        print(
+            f"[ORCHESTRATION] Promoted new champion model: {candidate_model_name} "
+            f"(return={challenger_metrics.get('total_return', 0.0):.2%}, "
+            f"dd={challenger_metrics.get('max_drawdown', 0.0):.2%}, "
+            f"trades={challenger_metrics.get('trades', 0)})"
+        )
+    else:
+        print("[ORCHESTRATION] Candidate rejected by promotion gates.")
 
     result = {
         "symbol": symbol,
@@ -1081,6 +1093,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         "variant_improvement": {
             "test_return_delta_vs_baseline": improvement,
             "test_max_drawdown_delta_vs_baseline": drawdown_delta,
+        },
+        "orchestration": {
+            "candidate_model": candidate_model_name,
+            "promoted": promoted,
+            "previous_champion": champion_model,
         },
         "training_profile": resolved_profile,
         "training_profile_requested": mode_setting,
