@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import torch
+from services.alpaca_candles import fetch_crypto_bars
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -33,6 +34,35 @@ TRAINING_LABEL = (os.getenv("TRAINING_LABEL") or os.getenv("TRAINING_VARIANT") o
 
 
 def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", retries: int = 4) -> pd.DataFrame:
+    """Fetch training market data.
+
+    Priority:
+    1) Alpaca crypto data for BTC (execution-aligned)
+    2) yfinance fallback for robustness
+    """
+    # Prefer Alpaca for BTC training so data distribution better matches execution.
+    use_alpaca_first = symbol.upper() in {"BTC-USD", "BTC/USD", "BTCUSD"}
+    if use_alpaca_first:
+        tf_map = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour"}
+        timeframe = tf_map.get(interval, "5Min")
+        lookback_days = 60
+        if period.endswith("d"):
+            try:
+                lookback_days = int(period[:-1])
+            except Exception:
+                lookback_days = 60
+        lookback_days = max(lookback_days, int(os.getenv("TRAINING_MIN_LOOKBACK_DAYS", "180")))
+
+        try:
+            alpaca_symbol = "BTC/USD"
+            df = fetch_crypto_bars(symbol=alpaca_symbol, timeframe=timeframe, lookback_days=lookback_days)
+            cleaned = df.dropna().copy()
+            if not cleaned.empty:
+                print(f"Using Alpaca market data for training: symbol={alpaca_symbol}, timeframe={timeframe}, rows={len(cleaned)}")
+                return cleaned
+        except Exception as e:
+            print(f"Alpaca market data unavailable, falling back to yfinance: {e}")
+
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
