@@ -63,15 +63,27 @@ def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d",
         except Exception as e:
             print(f"Alpaca market data unavailable, falling back to yfinance: {e}")
 
+    # yfinance intraday windows are capped (e.g., 5m ~= last 60 days), so clamp fallback period.
+    yf_period = period
+    intraday_intervals = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
+    if interval in intraday_intervals and str(period).endswith("d"):
+        try:
+            if int(str(period)[:-1]) > 60:
+                yf_period = "60d"
+        except Exception:
+            yf_period = "60d"
+
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            df = yf.download(symbol, interval=interval, period=period, progress=False, threads=False)
+            df = yf.download(symbol, interval=interval, period=yf_period, progress=False, threads=False)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] for c in df.columns]
             cleaned = df.dropna().copy()
             if cleaned.empty:
                 raise ValueError(f"No market data returned for {symbol}")
+            if yf_period != period:
+                print(f"Using yfinance fallback period={yf_period} for interval={interval} (requested {period})")
             return cleaned
         except Exception as e:
             last_err = e
