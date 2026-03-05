@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="/home/clawdbot/.openclaw/workspace/trading_bot"
+BOT_MEMORY_ROOT="/home/clawdbot/.openclaw/workspace/bot-memory"
 cd "$ROOT"
 
 set -a
@@ -21,19 +22,18 @@ TMP_DIR="$ROOT/data/backups/$STAMP"
 mkdir -p "$TMP_DIR"
 
 DB_FILE="$TMP_DIR/db_trading_bot.sql.gz"
-WS_FILE="$TMP_DIR/workspace.tgz"
-STATE_FILE="$TMP_DIR/openclaw_state.tgz"
+TB_REPO_BUNDLE="$TMP_DIR/trading_bot.bundle"
+BM_REPO_BUNDLE="$TMP_DIR/bot_memory.bundle"
 MANIFEST="$TMP_DIR/manifest.txt"
 
+# 1) Core trading data (DB) backup
 PGPASSWORD="$DB_PASS" pg_dump -h "${DB_HOST:-localhost}" -U "$DB_USER" -d "$DB_NAME" | gzip > "$DB_FILE"
 
-tar -czf "$WS_FILE" -C /home/clawdbot/.openclaw workspace
-
-tar -czf "$STATE_FILE" -C /home/clawdbot/.openclaw \
-  --exclude='workspace' \
-  --exclude='logs' \
-  --exclude='tmp' \
-  .
+# 2) Repo backup snapshots (portable git bundles)
+git -C "$ROOT" bundle create "$TB_REPO_BUNDLE" --all
+if [[ -d "$BOT_MEMORY_ROOT/.git" ]]; then
+  git -C "$BOT_MEMORY_ROOT" bundle create "$BM_REPO_BUNDLE" --all
+fi
 
 {
   echo "timestamp_utc=$STAMP"
