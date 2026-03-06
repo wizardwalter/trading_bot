@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -406,6 +407,7 @@ def _score_metrics(m: Metrics) -> float:
 
     return (
         (m.total_return * 3.2)
+        + (m.expectancy * 14.0)
         + (m.sharpe_like * 0.05)
         + (m.win_rate * 0.25)
         + (m.max_drawdown * 0.55)
@@ -413,6 +415,52 @@ def _score_metrics(m: Metrics) -> float:
         - risk_penalty
         - expectancy_penalty
     )
+
+
+def _regime_slices(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if df.empty or "atr_pct" not in df.columns or "trend" not in df.columns:
+        return {}
+
+    atr = df["atr_pct"].fillna(df["atr_pct"].median())
+    trend_abs = df["trend"].abs().fillna(0)
+
+    low_q = float(atr.quantile(0.35))
+    high_q = float(atr.quantile(0.75))
+
+    return {
+        "low_vol": df[atr <= low_q],
+        "mid_vol": df[(atr > low_q) & (atr < high_q)],
+        "high_vol": df[atr >= high_q],
+        "trend": df[trend_abs >= 0.22],
+        "chop": df[trend_abs <= 0.08],
+    }
+
+
+def _regime_penalty(df: pd.DataFrame, threshold: float) -> float:
+    slices = _regime_slices(df)
+    if not slices:
+        return 0.0
+
+    penalties = 0.0
+    covered = 0
+    for name, sdf in slices.items():
+        if len(sdf) < 180:
+            continue
+        m = simulate(sdf, threshold)
+        covered += 1
+        # Penalize regime fragility (especially negative expectancy and deep DD).
+        if m.expectancy < 0:
+            penalties += abs(m.expectancy) * 10.0
+        if m.total_return < 0:
+            penalties += abs(m.total_return) * 1.2
+        if m.max_drawdown < -0.08:
+            penalties += abs(m.max_drawdown + 0.08) * 0.8
+        if m.trades < 3:
+            penalties += 0.03
+
+    if covered == 0:
+        return 0.0
+    return penalties / covered
 
 
 def _neighbor_instability_penalty(df: pd.DataFrame, threshold: float, base_return: float) -> float:
@@ -504,11 +552,14 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
                 stability_penalty = 0.45 + recent_penalty - recent_bonus
                 recent_fold_return = 0.0
 
+            regime_penalty = _regime_penalty(train_df, float(th))
+
             score = (
-                (_score_metrics(full_m) * 0.40)
-                + (cv_score * 0.60)
+                (_score_metrics(full_m) * 0.35)
+                + (cv_score * 0.65)
                 - stability_penalty
                 - (instability_penalty * 0.75)
+                - (regime_penalty * 0.85)
                 - recent_penalty
                 + recent_bonus
                 - trade_scarcity_penalty
@@ -994,6 +1045,58 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
 
 from ml.model_orchestrator import ModelOrchestrator
 
+
+SHADOW_SCORE_PATH = Path("data/backtests/shadow_score.json")
+
+
+def _update_shadow_score(profile: str, variant: str, test: Metrics) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if SHADOW_SCORE_PATH.exists():
+        try:
+            payload = json.loads(SHADOW_SCORE_PATH.read_text())
+        except Exception:
+            payload = {}
+
+    hist = payload.get("history")
+    if not isinstance(hist, list):
+        hist = []
+
+    entry = {
+        "ts": datetime.utcnow().isoformat(),
+        "profile": profile,
+        "variant": variant,
+        "ret": float(test.total_return),
+        "dd": float(test.max_drawdown),
+        "trades": int(test.trades),
+        "win": float(test.win_rate),
+    }
+    hist.append(entry)
+    hist = hist[-200:]
+
+    recent = [x for x in hist if x.get("profile") == profile][-12:]
+    if recent:
+        avg_ret = float(np.mean([x.get("ret", 0.0) for x in recent]))
+        avg_dd = float(np.mean([x.get("dd", 0.0) for x in recent]))
+        positive_runs = sum(1 for x in recent if x.get("ret", 0.0) > 0)
+    else:
+        avg_ret, avg_dd, positive_runs = 0.0, 0.0, 0
+
+    stability = {
+        "window": len(recent),
+        "avg_ret": avg_ret,
+        "avg_dd": avg_dd,
+        "positive_runs": positive_runs,
+        "pass": (len(recent) >= 6 and avg_ret >= 0 and avg_dd >= -0.04 and positive_runs >= max(3, len(recent) // 2)),
+    }
+
+    payload["history"] = hist
+    payload["latest"] = entry
+    payload["stability"] = stability
+    SHADOW_SCORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SHADOW_SCORE_PATH.write_text(json.dumps(payload, indent=2))
+    return stability
+
+
 def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", training_mode: str | None = None):
     mode_setting = (training_mode or TRAINING_MODE or "auto").strip().lower()
     if mode_setting not in {"auto", "classic", "neural"}:
@@ -1106,9 +1209,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     challenger_metrics["variant"] = selected_name
     challenger_metrics["training_profile"] = resolved_profile
 
+    shadow_stability = _update_shadow_score(resolved_profile, selected_name, test)
+
     promoted = False
     candidate_model_name = f"{resolved_profile}:{selected_name}"
-    if orchestrator.should_promote(challenger_metrics):
+    if shadow_stability.get("pass") and orchestrator.should_promote(challenger_metrics):
         orchestrator.promote(candidate_model_name, challenger_metrics)
         promoted = True
         print(
@@ -1118,7 +1223,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             f"trades={challenger_metrics.get('trades', 0)})"
         )
     else:
-        print("[ORCHESTRATION] Candidate rejected by promotion gates.")
+        print("[ORCHESTRATION] Candidate rejected by promotion/shadow stability gates.")
 
     result = {
         "symbol": symbol,
@@ -1140,6 +1245,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             "candidate_model": candidate_model_name,
             "promoted": promoted,
             "previous_champion": champion_model,
+            "shadow_stability": shadow_stability,
         },
         "training_profile": resolved_profile,
         "training_profile_requested": mode_setting,
