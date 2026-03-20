@@ -43,17 +43,33 @@ def fetch_range(ticker: str, mult: int, span: str, start: date, end: date) -> li
 
     all_rows: list[dict] = []
     next_url = url
+    first_page = True
     while next_url:
-        if next_url.startswith('http'):
-            req_url = next_url
-            req_params = None
-        else:
+        if first_page:
             req_url = next_url
             req_params = params
+            first_page = False
+        else:
+            req_url = next_url
+            req_params = None
 
-        r = requests.get(req_url, params=req_params, timeout=40)
-        r.raise_for_status()
-        payload = r.json()
+        last_err: Exception | None = None
+        r = None
+        for attempt in range(1, 6):
+            try:
+                r = requests.get(req_url, params=req_params, timeout=40)
+                if r.status_code >= 400:
+                    snippet = r.text[:220]
+                    raise RuntimeError(f"HTTP {r.status_code}: {snippet}")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 5:
+                    time.sleep(min(0.5 * (2 ** (attempt - 1)), 5.0))
+                else:
+                    raise RuntimeError(f"Massive request failed for {req_url}: {last_err}")
+
+        payload = r.json() if r is not None else {}
         rows = payload.get('results', [])
         all_rows.extend(rows)
 
