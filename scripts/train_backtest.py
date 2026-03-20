@@ -24,6 +24,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from discord.notify import send_training_update
+from data.database import get_all_candles
 
 OUT_DIR = Path("data/backtests")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,13 +35,79 @@ if TRAINING_MODE not in {"auto", "classic", "neural"}:
 TRAINING_LABEL = (os.getenv("TRAINING_LABEL") or os.getenv("TRAINING_VARIANT") or "").strip()
 
 
+def _period_to_days(period: str) -> int:
+    p = str(period).strip().lower()
+    if p.endswith("d"):
+        return max(int(p[:-1]), 1)
+    if p.endswith("mo"):
+        return max(int(p[:-2]) * 30, 30)
+    if p.endswith("y"):
+        return max(int(p[:-1]) * 365, 365)
+    return 60
+
+
+def _download_from_db(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    df = get_all_candles(symbol, interval)
+    if df.empty:
+        raise RuntimeError(f"DB has no candles for {symbol} {interval}")
+
+    # Normalize schema from DB helper to expected OHLCV names.
+    out = df.copy()
+    if "open" in out.columns:
+        out.rename(
+            columns={
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+            },
+            inplace=True,
+        )
+
+    # Keep recent window requested by training period.
+    days = _period_to_days(period)
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=days)
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out = out[out["timestamp"] >= cutoff]
+    elif isinstance(out.index, pd.DatetimeIndex):
+        out = out[out.index >= cutoff]
+
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in cols if c not in out.columns]
+    if missing:
+        raise RuntimeError(f"DB candles missing columns: {missing}")
+
+    out = out[cols].copy()
+    for c in cols:
+        out[c] = pd.to_numeric(out[c], errors='coerce')
+    out = out.dropna().copy()
+    if out.empty:
+        raise RuntimeError(f"DB candles empty for {symbol} {interval} after period filter")
+    return out
+
+
 def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", retries: int = 4) -> pd.DataFrame:
     """Fetch training market data.
 
     Priority:
-    1) Alpaca crypto data for BTC (execution-aligned)
-    2) yfinance fallback for robustness
+    1) DB candles (Massive/Polygon historical backfill)
+    2) Alpaca crypto data for BTC (execution-aligned)
+    3) yfinance fallback for robustness
     """
+    source_pref = (os.getenv("TRAINING_DATA_SOURCE") or "db-first").strip().lower()
+
+    if source_pref in {"db", "db-first", "auto"}:
+        try:
+            db_df = _download_from_db(symbol=symbol, interval=interval, period=period)
+            print(f"Using DB market data for training: symbol={symbol}, interval={interval}, rows={len(db_df)}")
+            return db_df
+        except Exception as e:
+            print(f"DB market data unavailable for training, falling back: {e}")
+            if source_pref == "db":
+                raise
+
     # Prefer Alpaca for BTC training so data distribution better matches execution.
     use_alpaca_first = symbol.upper() in {"BTC-USD", "BTC/USD", "BTCUSD"}
     if use_alpaca_first:
