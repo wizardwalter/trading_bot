@@ -23,16 +23,17 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT'),
 }
 
+# "Meaningful" training timeframes we use (plus daily context).
 TIMEFRAMES = [
     ('1m', 'candles_1m', 1, 'minute'),
     ('5m', 'candles_5m', 5, 'minute'),
     ('15m', 'candles_15m', 15, 'minute'),
     ('1h', 'candles_1h', 1, 'hour'),
+    ('1d', 'candles_daily', 1, 'day'),
 ]
 
 
 def fetch_range(ticker: str, mult: int, span: str, start: date, end: date) -> list[dict]:
-    # Massive/Polygon aggs endpoint
     url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/{mult}/{span}/{start}/{end}"
     params = {
         'adjusted': 'true',
@@ -44,28 +45,25 @@ def fetch_range(ticker: str, mult: int, span: str, start: date, end: date) -> li
     all_rows: list[dict] = []
     next_url = url
     first_page = True
+
     while next_url:
-        if first_page:
-            req_url = next_url
-            req_params = params
-            first_page = False
-        else:
-            req_url = next_url
-            req_params = None
+        req_url = next_url
+        req_params = params if first_page else None
+        first_page = False
 
         last_err: Exception | None = None
         r = None
-        for attempt in range(1, 6):
+        for attempt in range(1, 7):
             try:
-                r = requests.get(req_url, params=req_params, timeout=40)
+                r = requests.get(req_url, params=req_params, timeout=45)
                 if r.status_code >= 400:
-                    snippet = r.text[:220]
+                    snippet = r.text[:240]
                     raise RuntimeError(f"HTTP {r.status_code}: {snippet}")
                 break
             except Exception as e:
                 last_err = e
-                if attempt < 5:
-                    time.sleep(min(0.5 * (2 ** (attempt - 1)), 5.0))
+                if attempt < 6:
+                    time.sleep(min(0.6 * (2 ** (attempt - 1)), 8.0))
                 else:
                     raise RuntimeError(f"Massive request failed for {req_url}: {last_err}")
 
@@ -77,16 +75,17 @@ def fetch_range(ticker: str, mult: int, span: str, start: date, end: date) -> li
         if nxt:
             sep = '&' if '?' in nxt else '?'
             next_url = f"{nxt}{sep}apiKey={API_KEY}"
-            time.sleep(0.08)
+            time.sleep(0.05)
         else:
             next_url = ''
 
     return all_rows
 
 
-def insert_rows(conn, table: str, symbol: str, rows: list[dict]):
+def insert_rows(conn, table: str, symbol: str, rows: list[dict]) -> int:
     if not rows:
         return 0
+
     tuples = []
     for r in rows:
         ts = datetime.fromtimestamp(r['t'] / 1000, tz=timezone.utc)
@@ -118,39 +117,67 @@ def insert_rows(conn, table: str, symbol: str, rows: list[dict]):
     return len(tuples)
 
 
+def max_ts(conn, table: str, symbol: str):
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT max(timestamp) FROM {table} WHERE symbol=%s", (symbol,))
+        return cur.fetchone()[0]
+
+
+def tf_step_days(tf_name: str) -> int:
+    # Keep request sizes sane while preserving throughput.
+    if tf_name == '1m':
+        return 30
+    if tf_name == '5m':
+        return 90
+    if tf_name == '15m':
+        return 180
+    if tf_name == '1h':
+        return 365
+    return 365 * 2
+
+
 def main():
     if not API_KEY:
         raise RuntimeError('Missing MASSIVE_API_KEY/POLYGON_API_KEY in .env')
 
-    symbol = 'BTC-USD'
-    massive_ticker = 'X:BTCUSD'
-    start = date(2018, 1, 1)
+    symbol = os.getenv('BACKFILL_SYMBOL', 'BTC-USD')
+    massive_ticker = os.getenv('BACKFILL_MASSIVE_TICKER', 'X:BTCUSD')
+    years = int(os.getenv('BACKFILL_YEARS', '10'))
     end = datetime.now(timezone.utc).date()
+    start_global = end - timedelta(days=max(years, 1) * 365)
 
     conn = psycopg2.connect(**DB_CONFIG)
-    total_inserted = {tf[0]: 0 for tf in TIMEFRAMES}
+    totals = {tf[0]: 0 for tf in TIMEFRAMES}
 
     try:
-        chunk_start = start
-        while chunk_start <= end:
-            chunk_end = min(chunk_start + timedelta(days=29), end)
-            print(f"Backfilling chunk {chunk_start} -> {chunk_end}")
+        print(f"Starting Massive backfill: symbol={symbol} ticker={massive_ticker} years={years} start={start_global} end={end}")
 
-            for tf_name, table, mult, span in TIMEFRAMES:
+        for tf_name, table, mult, span in TIMEFRAMES:
+            existing_max = max_ts(conn, table, symbol)
+            if existing_max is not None:
+                start = max(start_global, existing_max.date() - timedelta(days=2))
+            else:
+                start = start_global
+
+            step_days = tf_step_days(tf_name)
+            chunk_start = start
+            print(f"[{tf_name}] start={start} step_days={step_days}")
+
+            while chunk_start <= end:
+                chunk_end = min(chunk_start + timedelta(days=step_days - 1), end)
                 rows = fetch_range(massive_ticker, mult, span, chunk_start, chunk_end)
                 inserted = insert_rows(conn, table, symbol, rows)
-                total_inserted[tf_name] += inserted
-                print(f"  {tf_name}: fetched={len(rows)} upserted={inserted}")
-
-            chunk_start = chunk_end + timedelta(days=1)
-            time.sleep(0.2)
+                totals[tf_name] += inserted
+                print(f"[{tf_name}] {chunk_start} -> {chunk_end} fetched={len(rows)} upserted={inserted}")
+                chunk_start = chunk_end + timedelta(days=1)
+                time.sleep(0.06)
 
     finally:
         conn.close()
 
     print('Backfill complete:')
-    for k, v in total_inserted.items():
-        print(f"  {k}: {v}")
+    for tf, n in totals.items():
+        print(f"  {tf}: {n}")
 
 
 if __name__ == '__main__':
