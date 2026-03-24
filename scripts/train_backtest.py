@@ -237,10 +237,14 @@ class Metrics:
     threshold: float
     trades: int
     win_rate: float
+    win_loss_ratio: float
+    profit_factor: float
     expectancy: float
     total_return: float
     sharpe_like: float
     max_drawdown: float
+    consistency_score: float
+    do_not_trade: bool
 
 
 def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
@@ -308,6 +312,12 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13)
     bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13)
 
+    ml_raw_abs = np.abs(score_ml_raw)
+    low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
+    weak_trend = np.abs(trend) < 0.05
+    volatility_block = atr_pct > np.nanpercentile(atr_pct, 97)
+    do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block
+
     long_entry = (
         (score > buy_threshold)
         & bullish_confirmation
@@ -316,6 +326,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_long
         & (~high_vol_penalty_long)
         & (long_ml_gate | long_override)
+        & (~do_not_trade_filter)
     )
     short_entry = (
         (score < sell_threshold)
@@ -325,6 +336,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_short
         & (~high_vol_penalty_short)
         & (short_ml_gate | short_override)
+        & (~do_not_trade_filter)
     )
 
     long_exit = (
@@ -375,16 +387,26 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     return position
 
 
-def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_bps: float = 2.0) -> Metrics:
+def simulate(
+    df: pd.DataFrame,
+    threshold: float,
+    fee_bps: float = 4.0,
+    slippage_bps: float = 2.0,
+    latency_ms: float = 150.0,
+) -> Metrics:
     if df.empty:
         return Metrics(
             threshold=float(threshold),
             trades=0,
             win_rate=0.0,
+            win_loss_ratio=0.0,
+            profit_factor=0.0,
             expectancy=0.0,
             total_return=0.0,
             sharpe_like=0.0,
             max_drawdown=0.0,
+            consistency_score=0.0,
+            do_not_trade=True,
         )
 
     fee = fee_bps / 10_000
@@ -392,8 +414,12 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
 
     position = _target_position(df, threshold).astype(float)
 
-    # Position applies from the next bar onward.
-    position = pd.Series(position).shift(1).fillna(0).values
+    # Position applies from the next bar onward, plus latency delay approximation.
+    position = pd.Series(position).shift(1).fillna(0)
+    delay_bars = max(0, int(np.ceil(float(latency_ms) / (5 * 60 * 1000))))
+    if delay_bars > 0:
+        position = position.shift(delay_bars).fillna(0)
+    position = position.values
 
     rets = df["Close"].pct_change().fillna(0).values
     strat = position * rets
@@ -439,8 +465,17 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
         trade_rets.append(acc)
 
     trades = len(trade_rets)
+    wins = [x for x in trade_rets if x > 0]
+    losses = [x for x in trade_rets if x < 0]
     win_rate = float(np.mean(np.array(trade_rets) > 0)) if trades else 0.0
     expectancy = float(np.mean(trade_rets)) if trades else 0.0
+
+    gross_profit = float(np.sum(wins)) if wins else 0.0
+    gross_loss = abs(float(np.sum(losses))) if losses else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (9.99 if gross_profit > 0 else 0.0)
+    avg_win = float(np.mean(wins)) if wins else 0.0
+    avg_loss = abs(float(np.mean(losses))) if losses else 0.0
+    win_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else (9.99 if avg_win > 0 else 0.0)
 
     vol = float(pd.Series(strat).std())
     sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(252 * 24 * 12)) if vol > 0 else 0.0
@@ -449,14 +484,33 @@ def simulate(df: pd.DataFrame, threshold: float, fee_bps: float = 4.0, slippage_
     dd = (eq / rolling_max) - 1
     max_drawdown = float(dd.min())
 
+    # consistency across time buckets (higher is better)
+    buckets = np.array_split(np.array(strat, dtype=float), 6)
+    bucket_means = [float(np.mean(b)) for b in buckets if len(b) > 20]
+    if bucket_means:
+        consistency_score = float(np.mean(bucket_means) - (np.std(bucket_means) * 0.5))
+    else:
+        consistency_score = 0.0
+
+    do_not_trade = bool(
+        trades < 8
+        or max_drawdown < -0.08
+        or profit_factor < 1.02
+        or consistency_score < -0.0002
+    )
+
     return Metrics(
         threshold=float(threshold),
         trades=trades,
         win_rate=win_rate,
+        win_loss_ratio=win_loss_ratio,
+        profit_factor=profit_factor,
         expectancy=expectancy,
         total_return=total_return,
         sharpe_like=sharpe_like,
         max_drawdown=max_drawdown,
+        consistency_score=consistency_score,
+        do_not_trade=do_not_trade,
     )
 
 
@@ -466,21 +520,26 @@ def _score_metrics(m: Metrics) -> float:
         trades_penalty = 0.35
     elif m.trades < 12:
         trades_penalty = 0.18
-    elif m.trades > 32:
-        trades_penalty = 0.17
+    elif m.trades > 36:
+        trades_penalty = 0.20
 
     risk_penalty = 0.12 if m.max_drawdown < -0.11 else (0.05 if m.max_drawdown < -0.08 else 0.0)
     expectancy_penalty = 0.12 if (m.expectancy < 0 and m.win_rate < 0.4) else 0.0
+    dnt_penalty = 0.45 if m.do_not_trade else 0.0
 
     return (
-        (m.total_return * 3.2)
-        + (m.expectancy * 14.0)
+        (m.total_return * 3.0)
+        + (m.expectancy * 12.0)
         + (m.sharpe_like * 0.05)
-        + (m.win_rate * 0.25)
+        + (m.win_rate * 0.20)
+        + (m.profit_factor * 0.12)
+        + (m.win_loss_ratio * 0.08)
+        + (m.consistency_score * 40.0)
         + (m.max_drawdown * 0.55)
         - trades_penalty
         - risk_penalty
         - expectancy_penalty
+        - dnt_penalty
     )
 
 
@@ -545,6 +604,42 @@ def _neighbor_instability_penalty(df: pd.DataFrame, threshold: float, base_retur
     mean_diff = float(np.mean([abs(base_return - r) for r in neighbor_returns]))
     spread = float(np.std(neighbor_returns))
     return (mean_diff * 1.6) + (max(spread - 0.003, 0.0) * 1.1)
+
+
+def _walk_forward_summary(df: pd.DataFrame, threshold: float, train_ratio: float = 0.8) -> dict[str, float]:
+    n = len(df)
+    if n < 1200:
+        return {"folds": 0.0, "pass_ratio": 0.0, "avg_return": 0.0, "avg_pf": 0.0, "penalty": 0.25}
+
+    train_len = int(n * train_ratio)
+    test_len = max(240, int(n * 0.10))
+    step = max(120, int(test_len * 0.5))
+
+    start = 0
+    fold_metrics: list[Metrics] = []
+    while (start + train_len + test_len) <= n:
+        test_slice = df.iloc[start + train_len : start + train_len + test_len]
+        fold_metrics.append(simulate(test_slice, threshold))
+        start += step
+        if len(fold_metrics) >= 8:
+            break
+
+    if not fold_metrics:
+        return {"folds": 0.0, "pass_ratio": 0.0, "avg_return": 0.0, "avg_pf": 0.0, "penalty": 0.25}
+
+    passes = [1 for m in fold_metrics if (m.total_return > 0 and m.profit_factor >= 1.0 and not m.do_not_trade)]
+    pass_ratio = float(sum(passes) / len(fold_metrics))
+    avg_return = float(np.mean([m.total_return for m in fold_metrics]))
+    avg_pf = float(np.mean([m.profit_factor for m in fold_metrics]))
+    penalty = max(0.0, (0.65 - pass_ratio)) + (0.15 if avg_pf < 1.0 else 0.0)
+
+    return {
+        "folds": float(len(fold_metrics)),
+        "pass_ratio": pass_ratio,
+        "avg_return": avg_return,
+        "avg_pf": avg_pf,
+        "penalty": float(penalty),
+    }
 
 
 def pick_best(train_df: pd.DataFrame) -> Metrics:
@@ -620,13 +715,17 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
                 recent_fold_return = 0.0
 
             regime_penalty = _regime_penalty(train_df, float(th))
+            wfv = _walk_forward_summary(train_df, float(th))
 
             score = (
-                (_score_metrics(full_m) * 0.35)
-                + (cv_score * 0.65)
+                (_score_metrics(full_m) * 0.30)
+                + (cv_score * 0.55)
+                + (wfv["avg_return"] * 2.2)
+                + (wfv["avg_pf"] * 0.08)
                 - stability_penalty
                 - (instability_penalty * 0.75)
                 - (regime_penalty * 0.85)
+                - (wfv["penalty"] * 0.9)
                 - recent_penalty
                 + recent_bonus
                 - trade_scarcity_penalty
@@ -639,6 +738,10 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
                 "pessimistic_return": float(pessimistic_return),
                 "avg_fold_trades": float(avg_fold_trades),
                 "recent_last_return": float(recent_last_return),
+                "wf_folds": float(wfv["folds"]),
+                "wf_pass_ratio": float(wfv["pass_ratio"]),
+                "wf_avg_return": float(wfv["avg_return"]),
+                "wf_avg_pf": float(wfv["avg_pf"]),
             }
             scored_local.append((score, full_m, extras))
 
@@ -682,10 +785,14 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
             m.total_return > 0
             and m.max_drawdown >= -0.11
             and m.trades >= 8
+            and m.profit_factor >= 1.03
+            and (not m.do_not_trade)
             and extras["fold_count"] >= 3
             and extras["fold_positive"] >= max(2.0, extras["fold_count"] - 1)
             and extras["median_fold_return"] > 0
             and extras["pessimistic_return"] > -0.005
+            and extras.get("wf_folds", 0.0) >= 3
+            and extras.get("wf_pass_ratio", 0.0) >= 0.55
         )
     ]
 
@@ -699,6 +806,7 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
             m.total_return > 0
             and m.trades >= 9
             and m.max_drawdown >= -0.17
+            and m.profit_factor >= 1.0
             and extras["median_fold_return"] > -0.01
         )
     ]
@@ -1211,10 +1319,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         variant_results.append((variant_name, variant_df, best_variant, test_variant))
     elapsed_s = time.time() - start_time
 
-    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float]:
+    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float]:
         _, _, _, test_metrics = item
         return (
+            -1.0 if test_metrics.do_not_trade else 0.0,
             test_metrics.total_return,
+            test_metrics.profit_factor,
             -abs(test_metrics.max_drawdown),
             test_metrics.win_rate,
         )
@@ -1346,7 +1456,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         f"\nSymbol: {symbol} | Interval: {interval} | Period: {period}"
         f"\nTrain return: {best.total_return:.2%} | Test return: {test.total_return:.2%}"
         f"\nTest win rate: {test.win_rate:.2%} | Max drawdown: {test.max_drawdown:.2%}"
-        f"\nThreshold: {best.threshold:.3f} | Trades: {test.trades}"
+        f"\nProfit factor: {test.profit_factor:.2f} | Win/Loss ratio: {test.win_loss_ratio:.2f} | Consistency: {test.consistency_score:.5f}"
+        f"\nThreshold: {best.threshold:.3f} | Trades: {test.trades} | DoNotTrade: {test.do_not_trade}"
         f"\nVariant: {variant_note}"
         f"\nChampion: {champion_model}"
         f"{label_line}"
