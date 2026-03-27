@@ -19,6 +19,7 @@ from services.alpaca_candles import fetch_crypto_bars
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -278,6 +279,17 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     buy_threshold = buy_threshold + atr_boost
     sell_threshold = sell_threshold - atr_boost
 
+    # Regime-adaptive thresholding: tighter in chop/high-vol, looser in strong trend.
+    trend_abs = np.abs(trend)
+    chop_regime = trend_abs < np.nanpercentile(trend_abs, 35)
+    strong_trend = trend_abs > np.nanpercentile(trend_abs, 75)
+    extreme_vol = atr_pct > np.nanpercentile(atr_pct, 97)
+
+    buy_threshold = buy_threshold + np.where(chop_regime, 0.02, 0.0) + np.where(extreme_vol, 0.03, 0.0)
+    sell_threshold = sell_threshold - np.where(chop_regime, 0.02, 0.0) - np.where(extreme_vol, 0.03, 0.0)
+    buy_threshold = buy_threshold - np.where(strong_trend & (trend > 0), 0.015, 0.0)
+    sell_threshold = sell_threshold + np.where(strong_trend & (trend < 0), 0.015, 0.0)
+
     long_relief = (
         np.clip(volume_bias - 0.2, 0.0, 1.0) * 0.02
         + np.clip(range_score, 0.0, 0.4) * 0.02
@@ -316,7 +328,16 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
     weak_trend = np.abs(trend) < 0.05
     volatility_block = atr_pct > np.nanpercentile(atr_pct, 97)
-    do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block
+
+    if "meta_take_prob" in df.columns:
+        meta_take_prob = np.clip(df["meta_take_prob"].values, 0.001, 0.999)
+    else:
+        meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
+    min_take_prob = np.where(high_vol_regime, 0.57, 0.53)
+    min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
+    meta_skip = meta_take_prob < min_take_prob
+
+    do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block | meta_skip
 
     long_entry = (
         (score > buy_threshold)
@@ -976,12 +997,26 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
 
         pred_labels = (val_probs >= 0.5).astype(int)
         acc = accuracy_score(y_val, pred_labels)
+
+        calibrator = None
+        try:
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(val_probs, y_val.astype(float).to_numpy())
+            val_probs_cal = calibrator.predict(val_probs)
+            auc_cal = roc_auc_score(y_val, val_probs_cal)
+            if np.isfinite(auc_cal) and auc_cal >= auc:
+                val_probs = val_probs_cal
+                auc = float(auc_cal)
+        except Exception:
+            calibrator = None
+
         evaluated.append(
             {
                 "name": name,
                 "pipeline": pipeline,
                 "auc": float(auc),
                 "acc": float(acc),
+                "calibrator": calibrator,
             }
         )
 
@@ -1033,9 +1068,21 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
         val_features = feat_df.iloc[val_idx].values
         preds = neural_inference(trained_model, val_features, sequence_length=sequence_length, device=device)
 
-        auc = roc_auc_score(y_val[sequence_length:], preds)
+        y_val_seq = y_val[sequence_length:]
+        auc = roc_auc_score(y_val_seq, preds)
         pred_labels = (preds >= 0.5).astype(int)
-        acc = accuracy_score(y_val[sequence_length:], pred_labels)
+        acc = accuracy_score(y_val_seq, pred_labels)
+
+        calibrator = None
+        try:
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(preds, np.asarray(y_val_seq, dtype=float))
+            preds_cal = calibrator.predict(preds)
+            auc_cal = roc_auc_score(y_val_seq, preds_cal)
+            if np.isfinite(auc_cal) and auc_cal >= auc:
+                auc = float(auc_cal)
+        except Exception:
+            calibrator = None
 
         trained_model = trained_model.to("cpu")
         evaluated.append(
@@ -1046,6 +1093,7 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
                 "acc": float(acc),
                 "sequence_length": sequence_length,
                 "device": "cpu",
+                "calibrator": calibrator,
             }
         )
     except Exception as err:
@@ -1105,6 +1153,15 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
             print(f"Hybrid ML signal (h={horizon}, model={model_name}) inference failed: {err}")
             return None
 
+    calibrator = best_model.get("calibrator")
+    if calibrator is not None:
+        try:
+            full_probs = calibrator.predict(np.asarray(full_probs, dtype=float))
+        except Exception:
+            pass
+
+    full_probs = np.clip(np.asarray(full_probs, dtype=float), 0.001, 0.999)
+
     lift = max(0.0, float(auc) - 0.5)
     ml_weight = min(0.65, 0.22 + (lift * 1.8))
     ml_component = pd.Series(((full_probs - 0.5) * 2.0).clip(-1.0, 1.0), index=df.index)
@@ -1118,6 +1175,7 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
         "weight": ml_weight,
         "raw": ml_component,
         "smoothed": ml_smoothed,
+        "prob": pd.Series(full_probs, index=df.index),
         "val_size": len(y_val),
     }
 
@@ -1174,6 +1232,7 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
     sum_weights = 0.0
     raw_combo = None
     smooth_combo = None
+    prob_combo = None
 
     for idx, candidate in enumerate(blend_group):
         decay = max(0.55, 1.0 - (0.18 * idx))
@@ -1182,15 +1241,18 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         sum_weights += weight
         contrib_raw = candidate["raw"] * weight
         contrib_smooth = candidate["smoothed"] * weight
+        contrib_prob = candidate.get("prob", (candidate["raw"] * 0.5 + 0.5)) * weight
         raw_combo = contrib_raw if raw_combo is None else raw_combo + contrib_raw
         smooth_combo = contrib_smooth if smooth_combo is None else smooth_combo + contrib_smooth
+        prob_combo = contrib_prob if prob_combo is None else prob_combo + contrib_prob
 
-    if sum_weights <= 0 or raw_combo is None or smooth_combo is None:
+    if sum_weights <= 0 or raw_combo is None or smooth_combo is None or prob_combo is None:
         print("Hybrid ML signal skipped: blend weights collapsed to zero")
         return
 
     combined_raw = (raw_combo / sum_weights).clip(-1.0, 1.0)
     combined_smoothed = (smooth_combo / sum_weights).clip(-1.0, 1.0)
+    combined_prob = (prob_combo / sum_weights).clip(0.001, 0.999)
 
     base_std = float(base_score.std()) if hasattr(base_score, "std") else 0.0
     ml_std = float(combined_smoothed.std()) if hasattr(combined_smoothed, "std") else 0.0
@@ -1204,6 +1266,7 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
 
     df["score_ml_raw"] = combined_raw
     df["score_ml"] = combined_smoothed
+    df["meta_take_prob"] = combined_prob.ewm(span=16, adjust=False).mean().clip(0.001, 0.999)
     df["score"] = (effective_weight * combined_smoothed) + ((1.0 - effective_weight) * base_score)
 
     blend_summary = ", ".join(
