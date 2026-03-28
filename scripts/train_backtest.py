@@ -325,7 +325,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13)
 
     ml_raw_abs = np.abs(score_ml_raw)
-    low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
+    low_confidence = ml_raw_abs < np.maximum(0.05, threshold * 0.17)
     weak_trend = np.abs(trend) < 0.05
     volatility_block = atr_pct > np.nanpercentile(atr_pct, 97)
 
@@ -333,7 +333,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         meta_take_prob = np.clip(df["meta_take_prob"].values, 0.001, 0.999)
     else:
         meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
-    min_take_prob = np.where(high_vol_regime, 0.57, 0.53)
+    min_take_prob = np.where(high_vol_regime, 0.54, 0.50)
     min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
     meta_skip = meta_take_prob < min_take_prob
 
