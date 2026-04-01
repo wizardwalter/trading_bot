@@ -128,6 +128,12 @@ function drawChart(vals){
   ctx.font='12px Inter, system-ui, sans-serif';
   ctx.fillText(`target ${(TARGET_RET*100).toFixed(1)}%`, 10, Math.max(14, y(TARGET_RET)-6));
 
+  // axis labels
+  ctx.fillStyle='#8ea0d8';
+  ctx.font='11px Inter, system-ui, sans-serif';
+  ctx.fillText('Return %', 8, 14);
+  ctx.fillText('Recent iterations →', Math.max(8, W-130), H-8);
+
   // returns series
   ctx.beginPath();
   vals.forEach((v,i)=>{
