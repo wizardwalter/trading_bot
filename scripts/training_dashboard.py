@@ -55,6 +55,7 @@ HTML = """<!doctype html>
 const fmtPct = (v)=> (v===null||v===undefined||isNaN(v)) ? 'n/a' : (v*100).toFixed(2)+'%';
 const fmt = (v)=> (v===null||v===undefined||isNaN(v)) ? 'n/a' : Number(v).toFixed(2);
 let lastTs = null;
+const TARGET_RET = 0.01; // +1.0% target return line
 
 async function pull(){
   const [latestRes, shadowRes] = await Promise.all([
@@ -105,10 +106,29 @@ function drawChart(vals){
   ctx.scale(devicePixelRatio,devicePixelRatio);
   ctx.clearRect(0,0,c.clientWidth,c.clientHeight);
   const W=c.clientWidth,H=c.clientHeight;
-  ctx.strokeStyle='#2a355f'; ctx.beginPath(); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke();
-  if(!vals.length) return;
-  const max=Math.max(...vals,0.001), min=Math.min(...vals,-0.001);
+
+  if(!vals.length){
+    ctx.strokeStyle='#2a355f'; ctx.beginPath(); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke();
+    return;
+  }
+
+  const max=Math.max(...vals, TARGET_RET, 0.001), min=Math.min(...vals, -0.001);
   const y=v=> H-((v-min)/(max-min))*H;
+
+  // zero baseline
+  ctx.strokeStyle='#2a355f';
+  ctx.beginPath(); ctx.moveTo(0,y(0)); ctx.lineTo(W,y(0)); ctx.stroke();
+
+  // green target line
+  ctx.strokeStyle='#41d37b';
+  ctx.setLineDash([6,5]);
+  ctx.beginPath(); ctx.moveTo(0,y(TARGET_RET)); ctx.lineTo(W,y(TARGET_RET)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='#41d37b';
+  ctx.font='12px Inter, system-ui, sans-serif';
+  ctx.fillText(`target ${(TARGET_RET*100).toFixed(1)}%`, 10, Math.max(14, y(TARGET_RET)-6));
+
+  // returns series
   ctx.beginPath();
   vals.forEach((v,i)=>{
     const x=i*(W/(vals.length-1||1));
