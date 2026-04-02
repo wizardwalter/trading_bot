@@ -211,6 +211,12 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["ema_fast_2"] = out["Close"].ewm(span=24, adjust=False).mean()
     out["ema_slow_2"] = out["Close"].ewm(span=52, adjust=False).mean()
 
+    # Multi-timeframe context proxies (derived from 5m stream)
+    out["ret_1h"] = out["Close"].pct_change(12)
+    out["ret_4h"] = out["Close"].pct_change(48)
+    out["mtf_trend_1h"] = (out["ret_1h"] * 8.0).clip(-1, 1)
+    out["mtf_trend_4h"] = (out["ret_4h"] * 4.0).clip(-1, 1)
+
     trend = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-1, 1) * 220
     trend = trend.clip(-1, 1)
     m20 = (out["ret_20"] * 25).clip(-1, 1)
@@ -220,7 +226,31 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     volume_bias = np.tanh(out["volume_z"].clip(-3, 3) / 1.8)
     range_component = out["range_score"].clip(-1, 1)
 
-    out["score"] = 0.35 * trend + 0.15 * m20 + 0.05 * m3 + 0.45 * rsi_comp
+    # Regime/time features
+    if isinstance(out.index, pd.DatetimeIndex):
+        hour = out.index.hour
+        dow = out.index.dayofweek
+    else:
+        hour = pd.Series(0, index=out.index)
+        dow = pd.Series(0, index=out.index)
+    out["hour_sin"] = np.sin((2 * np.pi * hour) / 24.0)
+    out["hour_cos"] = np.cos((2 * np.pi * hour) / 24.0)
+    out["dow_sin"] = np.sin((2 * np.pi * dow) / 7.0)
+    out["dow_cos"] = np.cos((2 * np.pi * dow) / 7.0)
+
+    trend_abs = trend.abs()
+    out["regime_trend"] = (trend_abs > trend_abs.quantile(0.70)).astype(float)
+    out["regime_chop"] = (trend_abs < trend_abs.quantile(0.35)).astype(float)
+    out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
+
+    out["score"] = (
+        0.28 * trend
+        + 0.12 * m20
+        + 0.05 * m3
+        + 0.32 * rsi_comp
+        + 0.10 * out["mtf_trend_1h"].fillna(0.0)
+        + 0.08 * out["mtf_trend_4h"].fillna(0.0)
+    )
     out["score_raw"] = out["score"]
     out["trend"] = trend
     out["m3"] = m3
@@ -321,8 +351,11 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     long_override = score > (buy_threshold + 0.05)
     short_override = score < (sell_threshold - 0.05)
 
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13)
+    mtf_1h = df["mtf_trend_1h"].values if "mtf_trend_1h" in df.columns else np.zeros(len(df))
+    mtf_4h = df["mtf_trend_4h"].values if "mtf_trend_4h" in df.columns else np.zeros(len(df))
+
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20)
 
     ml_raw_abs = np.abs(score_ml_raw)
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
@@ -1197,6 +1230,15 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         "macd_hist",
         "price_momentum",
         "volume_trend",
+        "mtf_trend_1h",
+        "mtf_trend_4h",
+        "regime_trend",
+        "regime_chop",
+        "regime_high_vol",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
     ]
 
     missing_cols = [c for c in feature_cols if c not in df.columns]
