@@ -188,6 +188,14 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     vol_growth = out["Volume"].pct_change(36).replace([np.inf, -np.inf], np.nan)
     out["volume_trend"] = vol_growth.ewm(span=24, adjust=False).mean().clip(-4, 4).fillna(0.0)
 
+    # Directional flow burst proxy: short streaks of heavy volume + directional returns.
+    vol_fast = out["Volume"].rolling(3).mean()
+    vol_slow = out["Volume"].rolling(36).mean().replace(0, np.nan)
+    flow_burst = (vol_fast / vol_slow).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    impulse_3 = out["Close"].pct_change(3).fillna(0.0)
+    out["flow_burst"] = flow_burst.clip(0.5, 4.0)
+    out["flow_dir"] = np.tanh((impulse_3 * out["flow_burst"]) * 28.0).clip(-1.0, 1.0)
+
     volume = out["Volume"].ffill()
     vol_mean = volume.rolling(96).mean()
     vol_std = volume.rolling(96).std().replace(0, np.nan)
@@ -244,12 +252,13 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
 
     out["score"] = (
-        0.28 * trend
-        + 0.12 * m20
+        0.24 * trend
+        + 0.10 * m20
         + 0.05 * m3
-        + 0.32 * rsi_comp
+        + 0.28 * rsi_comp
         + 0.10 * out["mtf_trend_1h"].fillna(0.0)
         + 0.08 * out["mtf_trend_4h"].fillna(0.0)
+        + 0.15 * out["flow_dir"].fillna(0.0)
     )
     out["score_raw"] = out["score"]
     out["trend"] = trend
@@ -353,9 +362,11 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
 
     mtf_1h = df["mtf_trend_1h"].values if "mtf_trend_1h" in df.columns else np.zeros(len(df))
     mtf_4h = df["mtf_trend_4h"].values if "mtf_trend_4h" in df.columns else np.zeros(len(df))
+    flow_dir = df["flow_dir"].values if "flow_dir" in df.columns else np.zeros(len(df))
+    flow_burst = df["flow_burst"].values if "flow_burst" in df.columns else np.ones(len(df))
 
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20)
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20) & (flow_dir > -0.15)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20) & (flow_dir < 0.15)
 
     ml_raw_abs = np.abs(score_ml_raw)
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
@@ -372,6 +383,9 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
 
     do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block | meta_skip
 
+    flow_burst_long_ok = (flow_burst > 1.05) | (flow_dir > 0.25)
+    flow_burst_short_ok = (flow_burst > 1.05) | (flow_dir < -0.25)
+
     long_entry = (
         (score > buy_threshold)
         & bullish_confirmation
@@ -380,6 +394,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_long
         & (~high_vol_penalty_long)
         & (long_ml_gate | long_override)
+        & flow_burst_long_ok
         & (~do_not_trade_filter)
     )
     short_entry = (
@@ -390,6 +405,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_short
         & (~high_vol_penalty_short)
         & (short_ml_gate | short_override)
+        & flow_burst_short_ok
         & (~do_not_trade_filter)
     )
 
@@ -1239,6 +1255,8 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         "hour_cos",
         "dow_sin",
         "dow_cos",
+        "flow_burst",
+        "flow_dir",
     ]
 
     missing_cols = [c for c in feature_cols if c not in df.columns]
