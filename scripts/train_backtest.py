@@ -204,6 +204,23 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
 
     high_low = out["High"] - out["Low"]
     prev_close = out["Close"].shift(1)
+
+    # Candlestick anatomy features (quantitative pattern proxies)
+    body = (out["Close"] - out["Open"]).fillna(0.0)
+    candle_range = (high_low.replace(0, np.nan)).fillna(1e-9)
+    upper_wick = (out[["Open", "Close"]].max(axis=1) - out["High"]).abs()
+    lower_wick = (out["Low"] - out[["Open", "Close"]].min(axis=1)).abs()
+    out["body_ratio"] = (body.abs() / candle_range).clip(0.0, 1.0)
+    out["upper_wick_ratio"] = (upper_wick / candle_range).clip(0.0, 1.0)
+    out["lower_wick_ratio"] = (lower_wick / candle_range).clip(0.0, 1.0)
+    out["candle_dir"] = np.sign(body).clip(-1, 1)
+
+    # Simple engulfing / reversal pressure proxy
+    prev_open = out["Open"].shift(1)
+    prev_close2 = out["Close"].shift(1)
+    bull_engulf = ((out["Close"] > out["Open"]) & (prev_close2 < prev_open) & (out["Close"] >= prev_open) & (out["Open"] <= prev_close2)).astype(float)
+    bear_engulf = ((out["Close"] < out["Open"]) & (prev_close2 > prev_open) & (out["Open"] >= prev_close2) & (out["Close"] <= prev_open)).astype(float)
+    out["engulf_score"] = (bull_engulf - bear_engulf).clip(-1.0, 1.0)
     true_range = pd.concat([
         high_low,
         (out["High"] - prev_close).abs(),
@@ -211,6 +228,16 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     atr = true_range.rolling(48).mean()
     out["atr_pct"] = (atr / out["Close"]).fillna((high_low / out["Close"]).rolling(12).mean()).fillna(0.004)
+
+    # Compression → breakout proxies (triangle/flag/pennant style dynamics)
+    atr_slow = out["atr_pct"].rolling(96).mean().replace(0, np.nan)
+    out["compression"] = (1.0 - (out["atr_pct"] / atr_slow)).clip(-1.0, 1.0).fillna(0.0)
+    roll_hi = out["High"].rolling(24).max()
+    roll_lo = out["Low"].rolling(24).min()
+    breakout_up = (out["Close"] > roll_hi.shift(1)).astype(float)
+    breakout_dn = (out["Close"] < roll_lo.shift(1)).astype(float)
+    out["breakout_score"] = (breakout_up - breakout_dn) * (1.0 + out["compression"].clip(0.0, 1.0))
+    out["breakout_score"] = out["breakout_score"].clip(-2.0, 2.0)
 
     intraday_position = ((out["Close"] - out["Low"]) / (high_low.replace(0, np.nan))).clip(0, 1) - 0.5
     out["range_score"] = intraday_position.rolling(12).mean().fillna(0.0)
@@ -252,13 +279,15 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
 
     out["score"] = (
-        0.24 * trend
-        + 0.10 * m20
+        0.20 * trend
+        + 0.08 * m20
         + 0.05 * m3
-        + 0.28 * rsi_comp
-        + 0.10 * out["mtf_trend_1h"].fillna(0.0)
-        + 0.08 * out["mtf_trend_4h"].fillna(0.0)
-        + 0.15 * out["flow_dir"].fillna(0.0)
+        + 0.20 * rsi_comp
+        + 0.08 * out["mtf_trend_1h"].fillna(0.0)
+        + 0.06 * out["mtf_trend_4h"].fillna(0.0)
+        + 0.12 * out["flow_dir"].fillna(0.0)
+        + 0.09 * out["engulf_score"].fillna(0.0)
+        + 0.12 * out["breakout_score"].fillna(0.0)
     )
     out["score_raw"] = out["score"]
     out["trend"] = trend
@@ -364,9 +393,10 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     mtf_4h = df["mtf_trend_4h"].values if "mtf_trend_4h" in df.columns else np.zeros(len(df))
     flow_dir = df["flow_dir"].values if "flow_dir" in df.columns else np.zeros(len(df))
     flow_burst = df["flow_burst"].values if "flow_burst" in df.columns else np.ones(len(df))
+    breakout_score = df["breakout_score"].values if "breakout_score" in df.columns else np.zeros(len(df))
 
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20) & (flow_dir > -0.15)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20) & (flow_dir < 0.15)
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20) & (flow_dir > -0.15) & (breakout_score > -0.25)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20) & (flow_dir < 0.15) & (breakout_score < 0.25)
 
     ml_raw_abs = np.abs(score_ml_raw)
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
@@ -1257,6 +1287,13 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         "dow_cos",
         "flow_burst",
         "flow_dir",
+        "body_ratio",
+        "upper_wick_ratio",
+        "lower_wick_ratio",
+        "candle_dir",
+        "engulf_score",
+        "compression",
+        "breakout_score",
     ]
 
     missing_cols = [c for c in feature_cols if c not in df.columns]
