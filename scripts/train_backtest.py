@@ -336,8 +336,9 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     else:
         score_ml_raw = score_ml
 
-    exit_cooldown_bars = 3
-    flip_cooldown_bars = 1
+    exit_cooldown_bars = 4
+    flip_cooldown_bars = 2
+    min_hold_bars = 3
 
     buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
     sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
@@ -457,29 +458,41 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     position = np.zeros(len(df), dtype=np.int8)
     state = 0
     cooldown = 0
+    bars_in_position = 0
 
     for i in range(len(df)):
         if cooldown > 0:
             cooldown -= 1
 
         if state == 0:
+            bars_in_position = 0
             if cooldown == 0 and long_entry[i]:
                 state = 1
+                bars_in_position = 1
             elif cooldown == 0 and short_entry[i]:
                 state = -1
+                bars_in_position = 1
         elif state == 1:
-            if long_exit[i]:
+            bars_in_position += 1
+            can_exit = bars_in_position >= min_hold_bars
+            if can_exit and long_exit[i]:
                 state = 0
+                bars_in_position = 0
                 cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif short_entry[i]:
+            elif can_exit and short_entry[i]:
                 state = -1
+                bars_in_position = 1
                 cooldown = flip_cooldown_bars
         elif state == -1:
-            if short_exit[i]:
+            bars_in_position += 1
+            can_exit = bars_in_position >= min_hold_bars
+            if can_exit and short_exit[i]:
                 state = 0
+                bars_in_position = 0
                 cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif long_entry[i]:
+            elif can_exit and long_entry[i]:
                 state = 1
+                bars_in_position = 1
                 cooldown = flip_cooldown_bars
 
         position[i] = state
