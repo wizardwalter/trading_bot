@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -1397,6 +1397,63 @@ from ml.model_orchestrator import ModelOrchestrator
 SHADOW_SCORE_PATH = Path("data/backtests/shadow_score.json")
 
 
+def _shadow_variant_drift(profile: str, variant: str) -> tuple[float, dict[str, float]]:
+    """Return an adaptive score adjustment based on rolling shadow drift.
+
+    Positive values slightly favor a variant; negative values penalize variants
+    with persistent negative drift in recent windows.
+    """
+    if not SHADOW_SCORE_PATH.exists():
+        return 0.0, {}
+    try:
+        payload = json.loads(SHADOW_SCORE_PATH.read_text())
+    except Exception:
+        return 0.0, {}
+
+    hist = payload.get("history")
+    if not isinstance(hist, list) or not hist:
+        return 0.0, {}
+
+    scoped: list[dict[str, Any]] = []
+    for row in hist:
+        if row.get("profile") != profile or row.get("variant") != variant:
+            continue
+        ts_raw = row.get("ts")
+        if not ts_raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_raw))
+        except Exception:
+            continue
+        scoped.append({"ts": ts, "ret": float(row.get("ret", 0.0))})
+
+    if not scoped:
+        return 0.0, {}
+
+    now = max(r["ts"] for r in scoped)
+    windows_h = (24, 72, 168)
+    window_means: dict[str, float] = {}
+    score = 0.0
+
+    for wh in windows_h:
+        cutoff = now - timedelta(hours=wh)
+        vals = [r["ret"] for r in scoped if r["ts"] >= cutoff]
+        if not vals:
+            continue
+        m = float(np.mean(vals))
+        window_means[f"ret_{wh}h"] = m
+        if m < 0:
+            score -= min(0.02, abs(m) * 1.5)
+        else:
+            score += min(0.01, m * 0.8)
+
+    # Penalize short-term deterioration (24h worse than 72h).
+    if "ret_24h" in window_means and "ret_72h" in window_means and window_means["ret_24h"] < window_means["ret_72h"]:
+        score -= min(0.015, abs(window_means["ret_72h"] - window_means["ret_24h"]) * 2.0)
+
+    return float(score), window_means
+
+
 def _update_shadow_score(profile: str, variant: str, test: Metrics) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if SHADOW_SCORE_PATH.exists():
@@ -1492,11 +1549,13 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         variant_results.append((variant_name, variant_df, best_variant, test_variant))
     elapsed_s = time.time() - start_time
 
-    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float]:
-        _, _, _, test_metrics = item
+    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float, float]:
+        variant_name, _, _, test_metrics = item
+        drift_adj, _ = _shadow_variant_drift("neural" if mode_setting != "classic" else "classic", variant_name)
         return (
             -1.0 if test_metrics.do_not_trade else 0.0,
-            test_metrics.total_return,
+            test_metrics.total_return + drift_adj,
+            drift_adj,
             test_metrics.profit_factor,
             -abs(test_metrics.max_drawdown),
             test_metrics.win_rate,
