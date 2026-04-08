@@ -1551,11 +1551,23 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
     def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float, float]:
         variant_name, _, _, test_metrics = item
-        drift_adj, _ = _shadow_variant_drift("neural" if mode_setting != "classic" else "classic", variant_name)
+        drift_adj, drift_windows = _shadow_variant_drift("neural" if mode_setting != "classic" else "classic", variant_name)
+
+        # Prefer variants with healthier recent drift when signal-only mode degrades.
+        recency_penalty = 0.0
+        if "signal_only" in variant_name:
+            ret24 = float(drift_windows.get("ret_24h", 0.0))
+            ret72 = float(drift_windows.get("ret_72h", 0.0))
+            if ret24 < 0:
+                recency_penalty -= min(0.01, abs(ret24) * 1.8)
+            if ret24 < ret72:
+                recency_penalty -= min(0.01, abs(ret72 - ret24) * 3.0)
+
+        adjusted_return = test_metrics.total_return + drift_adj + recency_penalty
         return (
             -1.0 if test_metrics.do_not_trade else 0.0,
-            test_metrics.total_return + drift_adj,
-            drift_adj,
+            adjusted_return,
+            drift_adj + recency_penalty,
             test_metrics.profit_factor,
             -abs(test_metrics.max_drawdown),
             test_metrics.win_rate,
