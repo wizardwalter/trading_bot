@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -188,14 +188,6 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     vol_growth = out["Volume"].pct_change(36).replace([np.inf, -np.inf], np.nan)
     out["volume_trend"] = vol_growth.ewm(span=24, adjust=False).mean().clip(-4, 4).fillna(0.0)
 
-    # Directional flow burst proxy: short streaks of heavy volume + directional returns.
-    vol_fast = out["Volume"].rolling(3).mean()
-    vol_slow = out["Volume"].rolling(36).mean().replace(0, np.nan)
-    flow_burst = (vol_fast / vol_slow).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    impulse_3 = out["Close"].pct_change(3).fillna(0.0)
-    out["flow_burst"] = flow_burst.clip(0.5, 4.0)
-    out["flow_dir"] = np.tanh((impulse_3 * out["flow_burst"]) * 28.0).clip(-1.0, 1.0)
-
     volume = out["Volume"].ffill()
     vol_mean = volume.rolling(96).mean()
     vol_std = volume.rolling(96).std().replace(0, np.nan)
@@ -204,23 +196,6 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
 
     high_low = out["High"] - out["Low"]
     prev_close = out["Close"].shift(1)
-
-    # Candlestick anatomy features (quantitative pattern proxies)
-    body = (out["Close"] - out["Open"]).fillna(0.0)
-    candle_range = (high_low.replace(0, np.nan)).fillna(1e-9)
-    upper_wick = (out[["Open", "Close"]].max(axis=1) - out["High"]).abs()
-    lower_wick = (out["Low"] - out[["Open", "Close"]].min(axis=1)).abs()
-    out["body_ratio"] = (body.abs() / candle_range).clip(0.0, 1.0)
-    out["upper_wick_ratio"] = (upper_wick / candle_range).clip(0.0, 1.0)
-    out["lower_wick_ratio"] = (lower_wick / candle_range).clip(0.0, 1.0)
-    out["candle_dir"] = np.sign(body).clip(-1, 1)
-
-    # Simple engulfing / reversal pressure proxy
-    prev_open = out["Open"].shift(1)
-    prev_close2 = out["Close"].shift(1)
-    bull_engulf = ((out["Close"] > out["Open"]) & (prev_close2 < prev_open) & (out["Close"] >= prev_open) & (out["Open"] <= prev_close2)).astype(float)
-    bear_engulf = ((out["Close"] < out["Open"]) & (prev_close2 > prev_open) & (out["Open"] >= prev_close2) & (out["Close"] <= prev_open)).astype(float)
-    out["engulf_score"] = (bull_engulf - bear_engulf).clip(-1.0, 1.0)
     true_range = pd.concat([
         high_low,
         (out["High"] - prev_close).abs(),
@@ -228,16 +203,6 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     atr = true_range.rolling(48).mean()
     out["atr_pct"] = (atr / out["Close"]).fillna((high_low / out["Close"]).rolling(12).mean()).fillna(0.004)
-
-    # Compression → breakout proxies (triangle/flag/pennant style dynamics)
-    atr_slow = out["atr_pct"].rolling(96).mean().replace(0, np.nan)
-    out["compression"] = (1.0 - (out["atr_pct"] / atr_slow)).clip(-1.0, 1.0).fillna(0.0)
-    roll_hi = out["High"].rolling(24).max()
-    roll_lo = out["Low"].rolling(24).min()
-    breakout_up = (out["Close"] > roll_hi.shift(1)).astype(float)
-    breakout_dn = (out["Close"] < roll_lo.shift(1)).astype(float)
-    out["breakout_score"] = (breakout_up - breakout_dn) * (1.0 + out["compression"].clip(0.0, 1.0))
-    out["breakout_score"] = out["breakout_score"].clip(-2.0, 2.0)
 
     intraday_position = ((out["Close"] - out["Low"]) / (high_low.replace(0, np.nan))).clip(0, 1) - 0.5
     out["range_score"] = intraday_position.rolling(12).mean().fillna(0.0)
@@ -279,15 +244,12 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
 
     out["score"] = (
-        0.20 * trend
-        + 0.08 * m20
+        0.28 * trend
+        + 0.12 * m20
         + 0.05 * m3
-        + 0.20 * rsi_comp
-        + 0.08 * out["mtf_trend_1h"].fillna(0.0)
-        + 0.06 * out["mtf_trend_4h"].fillna(0.0)
-        + 0.12 * out["flow_dir"].fillna(0.0)
-        + 0.09 * out["engulf_score"].fillna(0.0)
-        + 0.12 * out["breakout_score"].fillna(0.0)
+        + 0.32 * rsi_comp
+        + 0.10 * out["mtf_trend_1h"].fillna(0.0)
+        + 0.08 * out["mtf_trend_4h"].fillna(0.0)
     )
     out["score_raw"] = out["score"]
     out["trend"] = trend
@@ -336,9 +298,8 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     else:
         score_ml_raw = score_ml
 
-    exit_cooldown_bars = 4
-    flip_cooldown_bars = 2
-    min_hold_bars = 3
+    exit_cooldown_bars = 3
+    flip_cooldown_bars = 1
 
     buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
     sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
@@ -392,12 +353,9 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
 
     mtf_1h = df["mtf_trend_1h"].values if "mtf_trend_1h" in df.columns else np.zeros(len(df))
     mtf_4h = df["mtf_trend_4h"].values if "mtf_trend_4h" in df.columns else np.zeros(len(df))
-    flow_dir = df["flow_dir"].values if "flow_dir" in df.columns else np.zeros(len(df))
-    flow_burst = df["flow_burst"].values if "flow_burst" in df.columns else np.ones(len(df))
-    breakout_score = df["breakout_score"].values if "breakout_score" in df.columns else np.zeros(len(df))
 
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20) & (flow_dir > -0.15) & (breakout_score > -0.25)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20) & (flow_dir < 0.15) & (breakout_score < 0.25)
+    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20)
+    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20)
 
     ml_raw_abs = np.abs(score_ml_raw)
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
@@ -408,14 +366,11 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         meta_take_prob = np.clip(df["meta_take_prob"].values, 0.001, 0.999)
     else:
         meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
-    min_take_prob = np.where(high_vol_regime, 0.60, 0.54)
+    min_take_prob = np.where(high_vol_regime, 0.58, 0.53)
     min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
     meta_skip = meta_take_prob < min_take_prob
 
     do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block | meta_skip
-
-    flow_burst_long_ok = (flow_burst > 1.05) | (flow_dir > 0.25)
-    flow_burst_short_ok = (flow_burst > 1.05) | (flow_dir < -0.25)
 
     long_entry = (
         (score > buy_threshold)
@@ -425,7 +380,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_long
         & (~high_vol_penalty_long)
         & (long_ml_gate | long_override)
-        & flow_burst_long_ok
         & (~do_not_trade_filter)
     )
     short_entry = (
@@ -436,7 +390,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_short
         & (~high_vol_penalty_short)
         & (short_ml_gate | short_override)
-        & flow_burst_short_ok
         & (~do_not_trade_filter)
     )
 
@@ -458,41 +411,29 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     position = np.zeros(len(df), dtype=np.int8)
     state = 0
     cooldown = 0
-    bars_in_position = 0
 
     for i in range(len(df)):
         if cooldown > 0:
             cooldown -= 1
 
         if state == 0:
-            bars_in_position = 0
             if cooldown == 0 and long_entry[i]:
                 state = 1
-                bars_in_position = 1
             elif cooldown == 0 and short_entry[i]:
                 state = -1
-                bars_in_position = 1
         elif state == 1:
-            bars_in_position += 1
-            can_exit = bars_in_position >= min_hold_bars
-            if can_exit and long_exit[i]:
+            if long_exit[i]:
                 state = 0
-                bars_in_position = 0
                 cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif can_exit and short_entry[i]:
+            elif short_entry[i]:
                 state = -1
-                bars_in_position = 1
                 cooldown = flip_cooldown_bars
         elif state == -1:
-            bars_in_position += 1
-            can_exit = bars_in_position >= min_hold_bars
-            if can_exit and short_exit[i]:
+            if short_exit[i]:
                 state = 0
-                bars_in_position = 0
                 cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif can_exit and long_entry[i]:
+            elif long_entry[i]:
                 state = 1
-                bars_in_position = 1
                 cooldown = flip_cooldown_bars
 
         position[i] = state
@@ -1298,15 +1239,6 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         "hour_cos",
         "dow_sin",
         "dow_cos",
-        "flow_burst",
-        "flow_dir",
-        "body_ratio",
-        "upper_wick_ratio",
-        "lower_wick_ratio",
-        "candle_dir",
-        "engulf_score",
-        "compression",
-        "breakout_score",
     ]
 
     missing_cols = [c for c in feature_cols if c not in df.columns]
@@ -1395,63 +1327,6 @@ from ml.model_orchestrator import ModelOrchestrator
 
 
 SHADOW_SCORE_PATH = Path("data/backtests/shadow_score.json")
-
-
-def _shadow_variant_drift(profile: str, variant: str) -> tuple[float, dict[str, float]]:
-    """Return an adaptive score adjustment based on rolling shadow drift.
-
-    Positive values slightly favor a variant; negative values penalize variants
-    with persistent negative drift in recent windows.
-    """
-    if not SHADOW_SCORE_PATH.exists():
-        return 0.0, {}
-    try:
-        payload = json.loads(SHADOW_SCORE_PATH.read_text())
-    except Exception:
-        return 0.0, {}
-
-    hist = payload.get("history")
-    if not isinstance(hist, list) or not hist:
-        return 0.0, {}
-
-    scoped: list[dict[str, Any]] = []
-    for row in hist:
-        if row.get("profile") != profile or row.get("variant") != variant:
-            continue
-        ts_raw = row.get("ts")
-        if not ts_raw:
-            continue
-        try:
-            ts = datetime.fromisoformat(str(ts_raw))
-        except Exception:
-            continue
-        scoped.append({"ts": ts, "ret": float(row.get("ret", 0.0))})
-
-    if not scoped:
-        return 0.0, {}
-
-    now = max(r["ts"] for r in scoped)
-    windows_h = (24, 72, 168)
-    window_means: dict[str, float] = {}
-    score = 0.0
-
-    for wh in windows_h:
-        cutoff = now - timedelta(hours=wh)
-        vals = [r["ret"] for r in scoped if r["ts"] >= cutoff]
-        if not vals:
-            continue
-        m = float(np.mean(vals))
-        window_means[f"ret_{wh}h"] = m
-        if m < 0:
-            score -= min(0.02, abs(m) * 1.5)
-        else:
-            score += min(0.01, m * 0.8)
-
-    # Penalize short-term deterioration (24h worse than 72h).
-    if "ret_24h" in window_means and "ret_72h" in window_means and window_means["ret_24h"] < window_means["ret_72h"]:
-        score -= min(0.015, abs(window_means["ret_72h"] - window_means["ret_24h"]) * 2.0)
-
-    return float(score), window_means
 
 
 def _update_shadow_score(profile: str, variant: str, test: Metrics) -> dict[str, Any]:
@@ -1549,25 +1424,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         variant_results.append((variant_name, variant_df, best_variant, test_variant))
     elapsed_s = time.time() - start_time
 
-    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float, float]:
-        variant_name, _, _, test_metrics = item
-        drift_adj, drift_windows = _shadow_variant_drift("neural" if mode_setting != "classic" else "classic", variant_name)
-
-        # Prefer variants with healthier recent drift when signal-only mode degrades.
-        recency_penalty = 0.0
-        if "signal_only" in variant_name:
-            ret24 = float(drift_windows.get("ret_24h", 0.0))
-            ret72 = float(drift_windows.get("ret_72h", 0.0))
-            if ret24 < 0:
-                recency_penalty -= min(0.01, abs(ret24) * 1.8)
-            if ret24 < ret72:
-                recency_penalty -= min(0.01, abs(ret72 - ret24) * 3.0)
-
-        adjusted_return = test_metrics.total_return + drift_adj + recency_penalty
+    def _variant_key(item: tuple[str, pd.DataFrame, Metrics, Metrics]) -> tuple[float, float, float, float, float]:
+        _, _, _, test_metrics = item
         return (
             -1.0 if test_metrics.do_not_trade else 0.0,
-            adjusted_return,
-            drift_adj + recency_penalty,
+            test_metrics.total_return,
             test_metrics.profit_factor,
             -abs(test_metrics.max_drawdown),
             test_metrics.win_rate,
