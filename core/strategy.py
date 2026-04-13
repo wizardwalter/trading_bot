@@ -108,7 +108,16 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
     except Exception:
         return fallback
 
-    candidate = payload.get("test", {}).get("threshold")
+    test_block = payload.get("test", {}) if isinstance(payload.get("test", {}), dict) else {}
+    # Reject calibrations that explicitly fail execution gates.
+    if bool(test_block.get("do_not_trade", False)):
+        return fallback
+
+    shadow_stability = payload.get("orchestration", {}).get("shadow_stability", {})
+    if isinstance(shadow_stability, dict) and shadow_stability.get("pass") is False:
+        return fallback
+
+    candidate = test_block.get("threshold")
     if candidate is None:
         candidate = payload.get("best_train", {}).get("threshold")
     if candidate is None:
