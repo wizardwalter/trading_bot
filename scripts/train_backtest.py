@@ -728,7 +728,9 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
         for th in candidates:
             full_m = simulate(train_df, float(th))
             instability_penalty = _neighbor_instability_penalty(train_df, float(th), full_m.total_return)
-            trade_scarcity_penalty = max(0.0, (6 - min(full_m.trades, 6)) * 0.03)
+            # Encourage sufficient sample size so we don't repeatedly select
+            # near-zero-trade thresholds during weak/sideways regimes.
+            trade_scarcity_penalty = max(0.0, (10 - min(full_m.trades, 10)) * 0.045)
 
             fold_metrics: list[Metrics] = []
             prev = fold_start
