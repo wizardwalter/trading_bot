@@ -366,10 +366,28 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         meta_take_prob = np.clip(df["meta_take_prob"].values, 0.001, 0.999)
     else:
         meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
-    # Drift guard: require slightly higher meta confidence before taking entries,
-    # especially after recent negative rolling performance.
-    min_take_prob = np.where(high_vol_regime, 0.66, 0.61)
-    min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
+    # Adaptive meta gate: target a healthy opportunity rate instead of hard static strictness.
+    # This prevents "always stricter" loops and lets the gate self-adjust by market state.
+    base_min_take_prob = np.where(high_vol_regime, 0.64, 0.58)
+    base_min_take_prob = np.where(np.abs(trend) > 0.25, base_min_take_prob - 0.03, base_min_take_prob)
+
+    candidate_intent = (
+        ((score > buy_threshold) | (score < sell_threshold))
+        & (~volatility_block)
+        & (np.abs(trend) > 0.03)
+    )
+    if np.any(candidate_intent):
+        adaptive_floor = float(np.quantile(meta_take_prob[candidate_intent], 0.62))
+    else:
+        adaptive_floor = float(np.quantile(meta_take_prob, 0.70))
+    adaptive_floor = float(np.clip(adaptive_floor, 0.52, 0.66))
+
+    min_take_prob = np.maximum(base_min_take_prob, adaptive_floor)
+    # Safety valve: if candidate opportunities are extremely sparse, relax a touch.
+    sparse_opportunity = np.mean(candidate_intent.astype(float)) < 0.06
+    if sparse_opportunity:
+        min_take_prob = np.clip(min_take_prob - 0.02, 0.50, 0.66)
+
     meta_skip = meta_take_prob < min_take_prob
 
     do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block | meta_skip
