@@ -368,7 +368,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
     # Drift guard: require slightly higher meta confidence before taking entries,
     # especially after recent negative rolling performance.
-    min_take_prob = np.where(high_vol_regime, 0.65, 0.60)
+    min_take_prob = np.where(high_vol_regime, 0.66, 0.61)
     min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
     meta_skip = meta_take_prob < min_take_prob
 
