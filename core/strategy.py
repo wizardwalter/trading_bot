@@ -126,7 +126,10 @@ def _symbol_profile(symbol: str) -> dict:
         return {
             "interval": interval,
             "period": "2d",
-            "entry_threshold": _load_backtest_threshold(s, base, expected_interval=interval),
+            # BTC live execution runs on 1m bars while backtests currently publish
+            # 5m calibrations; allow fresh backtest thresholds instead of always
+            # falling back to the static base.
+            "entry_threshold": _load_backtest_threshold(s, base, expected_interval=None),
         }
     # default day-trading profile for equities
     return {
