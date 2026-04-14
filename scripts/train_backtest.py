@@ -377,7 +377,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & (np.abs(trend) > 0.03)
     )
     if np.any(candidate_intent):
-        adaptive_floor = float(np.quantile(meta_take_prob[candidate_intent], 0.62))
+        adaptive_floor = float(np.quantile(meta_take_prob[candidate_intent], 0.66))
     else:
         adaptive_floor = float(np.quantile(meta_take_prob, 0.70))
     adaptive_floor = float(np.clip(adaptive_floor, 0.52, 0.66))
