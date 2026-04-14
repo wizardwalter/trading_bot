@@ -1443,7 +1443,23 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         neural_variants = [item for item in variant_results if item[0] != baseline_variant_name]
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
-        selected_variant = max(neural_variants, key=_variant_key)
+
+        best_neural = max(neural_variants, key=_variant_key)
+        baseline_candidate = next(item for item in variant_results if item[0] == baseline_variant_name)
+
+        allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "1") == "1"
+        _, _, _, neural_test = best_neural
+        _, _, _, baseline_test = baseline_candidate
+        neural_degraded = bool(neural_test.do_not_trade or neural_test.total_return < 0)
+
+        if allow_baseline_fallback and neural_degraded and _variant_key(baseline_candidate) > _variant_key(best_neural):
+            selected_variant = baseline_candidate
+            print(
+                "[ORCHESTRATION] Neural mode fallback activated: "
+                f"selected baseline variant '{baseline_variant_name}' over degraded neural candidate."
+            )
+        else:
+            selected_variant = best_neural
     else:
         selected_variant = max(variant_results, key=_variant_key)
 
