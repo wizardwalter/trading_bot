@@ -368,7 +368,7 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
     # Adaptive meta gate: target a healthy opportunity rate instead of hard static strictness.
     # This prevents "always stricter" loops and lets the gate self-adjust by market state.
-    base_min_take_prob = np.where(high_vol_regime, 0.64, 0.58)
+    base_min_take_prob = np.where(high_vol_regime, 0.60, 0.54)
     base_min_take_prob = np.where(np.abs(trend) > 0.25, base_min_take_prob - 0.03, base_min_take_prob)
 
     candidate_intent = (
@@ -1465,9 +1465,29 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         neural_variants = [item for item in variant_results if item[0] != baseline_variant_name]
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
-        selected_variant = max(neural_variants, key=_variant_key)
+
+        # Hard activity floor: prefer variants that actually trade and are not blocked.
+        active_neural = [
+            item for item in neural_variants
+            if (item[3].trades >= 6 and not item[3].do_not_trade)
+        ]
+        if active_neural:
+            selected_variant = max(active_neural, key=_variant_key)
+        else:
+            # Fallback to the most active neural candidate instead of zero-trade lockups.
+            selected_variant = max(
+                neural_variants,
+                key=lambda x: (x[3].trades, x[3].total_return, x[3].profit_factor),
+            )
     else:
-        selected_variant = max(variant_results, key=_variant_key)
+        active_any = [item for item in variant_results if (item[3].trades >= 6 and not item[3].do_not_trade)]
+        if active_any:
+            selected_variant = max(active_any, key=_variant_key)
+        else:
+            selected_variant = max(
+                variant_results,
+                key=lambda x: (x[3].trades, x[3].total_return, x[3].profit_factor),
+            )
 
     selected_name, selected_df, best, test = selected_variant
 
