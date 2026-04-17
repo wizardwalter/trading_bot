@@ -1329,6 +1329,54 @@ from ml.model_orchestrator import ModelOrchestrator
 SHADOW_SCORE_PATH = Path("data/backtests/shadow_score.json")
 
 
+def _shadow_window_metrics(payload: dict[str, Any], profile: str, hours: int) -> dict[str, float]:
+    hist = payload.get("history", []) if isinstance(payload, dict) else []
+    if not isinstance(hist, list):
+        return {"window_h": hours, "count": 0, "avg_ret": 0.0, "avg_dd": 0.0, "trade_sum": 0.0}
+
+    now_ts: datetime | None = None
+    latest = payload.get("latest", {}) if isinstance(payload, dict) else {}
+    if isinstance(latest, dict):
+        ts_raw = latest.get("ts")
+        if isinstance(ts_raw, str):
+            try:
+                now_ts = datetime.fromisoformat(ts_raw)
+            except Exception:
+                now_ts = None
+
+    scoped: list[dict[str, Any]] = []
+    for row in hist:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("profile", "")) != profile:
+            continue
+        ts_raw = row.get("ts")
+        if not isinstance(ts_raw, str):
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except Exception:
+            continue
+        if now_ts is None:
+            now_ts = ts
+        if now_ts and (now_ts - ts).total_seconds() <= hours * 3600:
+            scoped.append(row)
+
+    if not scoped:
+        return {"window_h": hours, "count": 0, "avg_ret": 0.0, "avg_dd": 0.0, "trade_sum": 0.0}
+
+    avg_ret = float(np.mean([float(x.get("ret", 0.0)) for x in scoped]))
+    avg_dd = float(np.mean([float(x.get("dd", 0.0)) for x in scoped]))
+    trade_sum = float(np.sum([float(x.get("trades", 0.0)) for x in scoped]))
+    return {
+        "window_h": hours,
+        "count": len(scoped),
+        "avg_ret": avg_ret,
+        "avg_dd": avg_dd,
+        "trade_sum": trade_sum,
+    }
+
+
 def _update_shadow_score(profile: str, variant: str, test: Metrics) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if SHADOW_SCORE_PATH.exists():
@@ -1440,11 +1488,13 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     # Drift guard: when recent shadow stability is failing, de-prioritize
     # signal-only candidates, which can overreact in choppy regimes.
     shadow_stability_prev: dict[str, Any] = {}
+    shadow_payload: dict[str, Any] = {}
     if SHADOW_SCORE_PATH.exists():
         try:
             shadow_payload = json.loads(SHADOW_SCORE_PATH.read_text())
             shadow_stability_prev = shadow_payload.get("stability", {}) if isinstance(shadow_payload, dict) else {}
         except Exception:
+            shadow_payload = {}
             shadow_stability_prev = {}
 
     disallow_signal_only_when_unstable = os.getenv("NEURAL_DISALLOW_SIGNAL_ONLY_WHEN_UNSTABLE", "1") == "1"
@@ -1453,6 +1503,24 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and shadow_stability_prev.get("window", 0) >= 6
         and shadow_stability_prev.get("pass") is False
     )
+
+    rolling_24h = _shadow_window_metrics(shadow_payload, "neural", 24)
+    rolling_72h = _shadow_window_metrics(shadow_payload, "neural", 72)
+    rolling_7d = _shadow_window_metrics(shadow_payload, "neural", 168)
+    drift_negative = bool(
+        rolling_24h.get("count", 0) >= 10
+        and rolling_72h.get("count", 0) >= 20
+        and rolling_24h.get("avg_ret", 0.0) < 0
+        and rolling_24h.get("avg_ret", 0.0) < rolling_72h.get("avg_ret", 0.0)
+    )
+    if drift_negative:
+        print(
+            "[ORCHESTRATION] Rolling drift guard active: "
+            f"24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, "
+            f"72h_ret={rolling_72h.get('avg_ret', 0.0):.4f}, "
+            f"7d_ret={rolling_7d.get('avg_ret', 0.0):.4f}."
+        )
+        stability_failing = True
 
     if mode_setting == "classic":
         selected_variant = next(item for item in variant_results if item[0] == baseline_variant_name)
