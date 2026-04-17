@@ -130,7 +130,7 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
 def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
-        base = 0.14  # tighter BTC threshold to reduce churn in noisy microstructure
+        base = 0.15  # slightly stricter BTC threshold after negative drift to curb marginal entries
         interval = "1m"
         return {
             "interval": interval,
