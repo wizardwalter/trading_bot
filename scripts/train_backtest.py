@@ -1437,6 +1437,23 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     if not variant_results:
         raise RuntimeError("No training variants were evaluated")
 
+    # Drift guard: when recent shadow stability is failing, de-prioritize
+    # signal-only candidates, which can overreact in choppy regimes.
+    shadow_stability_prev: dict[str, Any] = {}
+    if SHADOW_SCORE_PATH.exists():
+        try:
+            shadow_payload = json.loads(SHADOW_SCORE_PATH.read_text())
+            shadow_stability_prev = shadow_payload.get("stability", {}) if isinstance(shadow_payload, dict) else {}
+        except Exception:
+            shadow_stability_prev = {}
+
+    disallow_signal_only_when_unstable = os.getenv("NEURAL_DISALLOW_SIGNAL_ONLY_WHEN_UNSTABLE", "1") == "1"
+    stability_failing = bool(
+        isinstance(shadow_stability_prev, dict)
+        and shadow_stability_prev.get("window", 0) >= 6
+        and shadow_stability_prev.get("pass") is False
+    )
+
     if mode_setting == "classic":
         selected_variant = next(item for item in variant_results if item[0] == baseline_variant_name)
     elif mode_setting == "neural":
@@ -1444,22 +1461,6 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
 
-        # Drift guard: when recent shadow stability is failing, de-prioritize
-        # signal-only candidates, which can overreact in choppy regimes.
-        shadow_stability_prev: dict[str, Any] = {}
-        if SHADOW_SCORE_PATH.exists():
-            try:
-                shadow_payload = json.loads(SHADOW_SCORE_PATH.read_text())
-                shadow_stability_prev = shadow_payload.get("stability", {}) if isinstance(shadow_payload, dict) else {}
-            except Exception:
-                shadow_stability_prev = {}
-
-        disallow_signal_only_when_unstable = os.getenv("NEURAL_DISALLOW_SIGNAL_ONLY_WHEN_UNSTABLE", "1") == "1"
-        stability_failing = bool(
-            isinstance(shadow_stability_prev, dict)
-            and shadow_stability_prev.get("window", 0) >= 6
-            and shadow_stability_prev.get("pass") is False
-        )
         if disallow_signal_only_when_unstable and stability_failing:
             filtered = [item for item in neural_variants if "signal_only" not in item[0]]
             if filtered:
@@ -1494,7 +1495,17 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         else:
             selected_variant = best_neural
     else:
-        selected_variant = max(variant_results, key=_variant_key)
+        auto_candidates = list(variant_results)
+        if disallow_signal_only_when_unstable and stability_failing:
+            filtered = [item for item in auto_candidates if "signal_only" not in item[0]]
+            if filtered:
+                print(
+                    "[ORCHESTRATION] Drift guard active (auto mode): excluding signal-only variants "
+                    f"while shadow stability is failing (window={shadow_stability_prev.get('window')}, "
+                    f"avg_ret={shadow_stability_prev.get('avg_ret')}, pass={shadow_stability_prev.get('pass')})."
+                )
+                auto_candidates = filtered
+        selected_variant = max(auto_candidates, key=_variant_key)
 
     selected_name, selected_df, best, test = selected_variant
 
