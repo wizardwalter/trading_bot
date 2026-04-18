@@ -1544,6 +1544,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
         allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "1") == "1"
         min_neural_test_trades = int(os.getenv("NEURAL_MIN_TEST_TRADES", "6"))
+        force_baseline_on_negative_drift = os.getenv("NEURAL_FORCE_BASELINE_ON_NEGATIVE_DRIFT", "1") == "1"
         _, _, _, neural_test = best_neural
         _, _, _, baseline_test = baseline_candidate
         neural_degraded = bool(
@@ -1552,7 +1553,22 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             or neural_test.trades < min_neural_test_trades
         )
 
-        if allow_baseline_fallback and neural_degraded and _variant_key(baseline_candidate) > _variant_key(best_neural):
+        forced_defensive_fallback = bool(
+            drift_negative
+            and force_baseline_on_negative_drift
+            and neural_test.do_not_trade
+            and neural_test.total_return < 0
+        )
+
+        if forced_defensive_fallback:
+            selected_variant = baseline_candidate
+            print(
+                "[ORCHESTRATION] Defensive fallback activated: forcing baseline in neural mode "
+                f"during negative drift (24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, "
+                f"72h_ret={rolling_72h.get('avg_ret', 0.0):.4f}, neural_ret={neural_test.total_return:.2%}, "
+                f"neural_dnt={neural_test.do_not_trade})."
+            )
+        elif allow_baseline_fallback and neural_degraded and _variant_key(baseline_candidate) > _variant_key(best_neural):
             selected_variant = baseline_candidate
             print(
                 "[ORCHESTRATION] Neural mode fallback activated: "
