@@ -127,18 +127,79 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
     return float(min(max(float(candidate), 0.08), 0.60))
 
 
+def _shadow_drift_penalty(symbol: str) -> float:
+    """Return an additive threshold penalty when recent shadow drift is deteriorating."""
+    path = Path(os.getenv("BACKTEST_SHADOW_PATH", "data/backtests/shadow_score.json"))
+    if not path.exists():
+        return 0.0
+
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return 0.0
+
+    history = payload.get("history", []) if isinstance(payload, dict) else []
+    if not isinstance(history, list) or not history:
+        return 0.0
+
+    rows = []
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("profile", "")).lower() != "neural":
+            continue
+        if str(row.get("variant", "")).lower() == "baseline":
+            continue
+        ts_raw = row.get("ts")
+        try:
+            ts = datetime.fromisoformat(str(ts_raw))
+        except Exception:
+            continue
+        rows.append({"ts": ts, "ret": float(row.get("ret", 0.0)), "dd": float(row.get("dd", 0.0))})
+
+    if len(rows) < 24:
+        return 0.0
+
+    now = max(item["ts"] for item in rows)
+
+    def _window(hours: int) -> list[dict]:
+        cutoff_s = hours * 3600
+        return [item for item in rows if (now - item["ts"]).total_seconds() <= cutoff_s]
+
+    window_24h = _window(24)
+    window_72h = _window(72)
+    if len(window_24h) < 12 or len(window_72h) < 24:
+        return 0.0
+
+    avg_ret_24h = sum(item["ret"] for item in window_24h) / len(window_24h)
+    avg_ret_72h = sum(item["ret"] for item in window_72h) / len(window_72h)
+    avg_dd_24h = sum(item["dd"] for item in window_24h) / len(window_24h)
+    avg_dd_72h = sum(item["dd"] for item in window_72h) / len(window_72h)
+
+    drift_negative = avg_ret_24h < 0 and avg_ret_24h < avg_ret_72h
+    drawdown_worse = avg_dd_24h < avg_dd_72h
+
+    if drift_negative and drawdown_worse:
+        # Keep the response measured: add a modest +2% score threshold until
+        # rolling metrics stabilize.
+        return float(os.getenv("BTC_DRIFT_THRESHOLD_PENALTY", "0.02"))
+
+    return 0.0
+
+
 def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
         base = 0.15  # slightly stricter BTC threshold after negative drift to curb marginal entries
         interval = "1m"
+        adaptive_base = min(base + _shadow_drift_penalty(s), 0.22)
         return {
             "interval": interval,
             "period": "2d",
             # BTC live execution runs on 1m bars while backtests currently publish
             # 5m calibrations; allow fresh backtest thresholds instead of always
             # falling back to the static base.
-            "entry_threshold": _load_backtest_threshold(s, base, expected_interval=None),
+            "entry_threshold": _load_backtest_threshold(s, adaptive_base, expected_interval=None),
         }
     # default day-trading profile for equities
     return {
