@@ -1399,7 +1399,10 @@ def _update_shadow_score(profile: str, variant: str, test: Metrics) -> dict[str,
         "win": float(test.win_rate),
     }
     hist.append(entry)
-    hist = hist[-200:]
+    max_shadow_history = int(os.getenv("SHADOW_SCORE_MAX_HISTORY", "1200"))
+    if max_shadow_history < 200:
+        max_shadow_history = 200
+    hist = hist[-max_shadow_history:]
 
     recent = [x for x in hist if x.get("profile") == profile][-12:]
     if recent:
@@ -1510,8 +1513,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     drift_negative = bool(
         rolling_24h.get("count", 0) >= 10
         and rolling_72h.get("count", 0) >= 20
+        and rolling_7d.get("count", 0) >= 40
         and rolling_24h.get("avg_ret", 0.0) < 0
         and rolling_24h.get("avg_ret", 0.0) < rolling_72h.get("avg_ret", 0.0)
+        and rolling_24h.get("avg_ret", 0.0) < rolling_7d.get("avg_ret", 0.0)
+        and rolling_24h.get("avg_dd", 0.0) < min(rolling_72h.get("avg_dd", 0.0), rolling_7d.get("avg_dd", 0.0))
     )
     if drift_negative:
         print(
