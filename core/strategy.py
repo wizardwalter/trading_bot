@@ -168,21 +168,26 @@ def _shadow_drift_penalty(symbol: str) -> float:
 
     window_24h = _window(24)
     window_72h = _window(72)
-    if len(window_24h) < 12 or len(window_72h) < 24:
+    window_7d = _window(24 * 7)
+    if len(window_24h) < 12 or len(window_72h) < 24 or len(window_7d) < 48:
         return 0.0
 
     avg_ret_24h = sum(item["ret"] for item in window_24h) / len(window_24h)
     avg_ret_72h = sum(item["ret"] for item in window_72h) / len(window_72h)
+    avg_ret_7d = sum(item["ret"] for item in window_7d) / len(window_7d)
     avg_dd_24h = sum(item["dd"] for item in window_24h) / len(window_24h)
     avg_dd_72h = sum(item["dd"] for item in window_72h) / len(window_72h)
+    avg_dd_7d = sum(item["dd"] for item in window_7d) / len(window_7d)
 
     drift_negative = avg_ret_24h < 0 and avg_ret_24h < avg_ret_72h
     drawdown_worse = avg_dd_24h < avg_dd_72h
+    broad_deterioration = avg_ret_72h < avg_ret_7d and avg_dd_72h < avg_dd_7d
 
     if drift_negative and drawdown_worse:
-        # Keep the response measured: add a modest +2% score threshold until
-        # rolling metrics stabilize.
-        return float(os.getenv("BTC_DRIFT_THRESHOLD_PENALTY", "0.02"))
+        # Keep the response measured: +2% by default, escalating to +3% only
+        # when deterioration is persistent across 24h/72h/7d windows.
+        default_penalty = "0.03" if broad_deterioration else "0.02"
+        return float(os.getenv("BTC_DRIFT_THRESHOLD_PENALTY", default_penalty))
 
     return 0.0
 
