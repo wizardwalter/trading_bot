@@ -300,7 +300,7 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
 
     # Regime filter: avoid new entries in high-volatility downside chop where the
     # current model historically overtrades and bleeds on fees/slippage.
-    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > 0.02
+    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > 0.018
 
     # Require at least one supportive regime signal for non-rebound buys.
     bullish_alignment = (trend_component > 0.0) or (momentum_component > 0.0 and short_momentum_component > -0.05)
