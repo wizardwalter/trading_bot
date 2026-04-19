@@ -1550,7 +1550,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
         allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "1") == "1"
         min_neural_test_trades = int(os.getenv("NEURAL_MIN_TEST_TRADES", "6"))
-        force_baseline_on_negative_drift = os.getenv("NEURAL_FORCE_BASELINE_ON_NEGATIVE_DRIFT", "0") == "1"
+        force_baseline_on_negative_drift = os.getenv("NEURAL_FORCE_BASELINE_ON_NEGATIVE_DRIFT", "1") == "1"
         _, _, _, neural_test = best_neural
         _, _, _, baseline_test = baseline_candidate
         neural_degraded = bool(
