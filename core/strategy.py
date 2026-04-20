@@ -148,8 +148,6 @@ def _shadow_drift_penalty(symbol: str) -> float:
             continue
         if str(row.get("profile", "")).lower() != "neural":
             continue
-        if str(row.get("variant", "")).lower() == "baseline":
-            continue
         ts_raw = row.get("ts")
         try:
             ts = datetime.fromisoformat(str(ts_raw))
@@ -184,9 +182,9 @@ def _shadow_drift_penalty(symbol: str) -> float:
     broad_deterioration = avg_ret_72h < avg_ret_7d and avg_dd_72h < avg_dd_7d
 
     if drift_negative and drawdown_worse:
-        # Keep the response measured: +2% by default, escalating to +3% only
-        # when deterioration is persistent across 24h/72h/7d windows.
-        default_penalty = 0.03 if broad_deterioration else 0.02
+        # Keep the response measured: +2% by default, escalating to +4% when
+        # deterioration is persistent across 24h/72h/7d windows.
+        default_penalty = 0.04 if broad_deterioration else 0.02
 
         # Add a small severity step when short-horizon decay is materially worse
         # than medium horizon performance. This tightens entries by up to +1%
