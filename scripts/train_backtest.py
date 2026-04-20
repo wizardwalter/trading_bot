@@ -1528,6 +1528,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         )
         stability_failing = True
 
+    severe_short_window_drift = bool(
+        drift_negative
+        and rolling_24h.get("avg_ret", 0.0) <= -0.015
+        and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.004
+    )
+    if severe_short_window_drift and disallow_signal_only_when_unstable:
+        print(
+            "[ORCHESTRATION] Severe short-window drift detected; allowing signal-only "
+            "neural variant despite stability guard for defensive low-exposure fallback."
+        )
+        disallow_signal_only_when_unstable = False
+
     if mode_setting == "classic":
         selected_variant = next(item for item in variant_results if item[0] == baseline_variant_name)
     elif mode_setting == "neural":
