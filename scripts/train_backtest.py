@@ -1548,7 +1548,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         best_neural = max(neural_variants, key=_variant_key)
         baseline_candidate = next(item for item in variant_results if item[0] == baseline_variant_name)
 
-        allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "0") == "1"
+        allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "1") == "1"
         min_neural_test_trades = int(os.getenv("NEURAL_MIN_TEST_TRADES", "6"))
         # Keep defensive fallback opt-in: baseline has recently underperformed,
         # so forcing it during generic negative drift can amplify losses.
