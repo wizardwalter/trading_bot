@@ -205,10 +205,12 @@ def _symbol_profile(symbol: str) -> dict:
     if s == "BTC-USD":
         base = 0.15  # slightly stricter BTC threshold after negative drift to curb marginal entries
         interval = "1m"
-        adaptive_base = min(base + _shadow_drift_penalty(s), 0.22)
+        drift_penalty = _shadow_drift_penalty(s)
+        adaptive_base = min(base + drift_penalty, 0.22)
         return {
             "interval": interval,
             "period": "2d",
+            "drift_penalty": drift_penalty,
             # BTC live execution runs on 1m bars while backtests currently publish
             # 5m calibrations; allow fresh backtest thresholds instead of always
             # falling back to the static base.
@@ -219,6 +221,7 @@ def _symbol_profile(symbol: str) -> dict:
         "interval": "5m",
         "period": "5d",
         "entry_threshold": 0.12,
+        "drift_penalty": 0.0,
     }
 
 
@@ -308,7 +311,10 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
 
     # Regime filter: avoid new entries in high-volatility downside chop where the
     # current model historically overtrades and bleeds on fees/slippage.
-    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > 0.018
+    # When shadow drift is negative, tighten the volatility guard incrementally.
+    drift_penalty = float(profile.get("drift_penalty", 0.0))
+    risk_off_vol_threshold = max(0.014, 0.018 - (0.04 * min(max(drift_penalty, 0.0), 0.05)))
+    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > risk_off_vol_threshold
 
     # Require at least one supportive regime signal for non-rebound buys.
     bullish_alignment = (trend_component > 0.0) or (momentum_component > 0.0 and short_momentum_component > -0.05)
