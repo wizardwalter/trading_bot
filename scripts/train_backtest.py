@@ -1602,13 +1602,19 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 f"72h_ret={rolling_72h.get('avg_ret', 0.0):.4f}, neural_ret={neural_test.total_return:.2%}, "
                 f"neural_dnt={neural_test.do_not_trade})."
             )
-        elif allow_baseline_fallback and neural_degraded and _variant_key(baseline_candidate) > _variant_key(best_neural):
+        elif (
+            allow_baseline_fallback
+            and neural_degraded
+            and baseline_test.total_return > 0
+            and _variant_key(baseline_candidate) > _variant_key(best_neural)
+        ):
             selected_variant = baseline_candidate
             print(
                 "[ORCHESTRATION] Neural mode fallback activated: "
                 f"selected baseline variant '{baseline_variant_name}' over degraded neural candidate "
                 f"(ret={neural_test.total_return:.2%}, trades={neural_test.trades}, "
-                f"dnt={neural_test.do_not_trade}, min_trades={min_neural_test_trades})."
+                f"dnt={neural_test.do_not_trade}, min_trades={min_neural_test_trades}, "
+                f"baseline_ret={baseline_test.total_return:.2%})."
             )
         else:
             selected_variant = best_neural
