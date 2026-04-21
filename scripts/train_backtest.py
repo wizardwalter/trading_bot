@@ -1547,6 +1547,10 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
 
+        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "3"))
+        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "0.90"))
+        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.003"))
+
         if severe_short_window_drift:
             signal_only_variants = [
                 item
@@ -1562,12 +1566,26 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 neural_variants = signal_only_variants
 
         if disallow_signal_only_when_unstable and stability_failing:
-            filtered = [item for item in neural_variants if "signal_only" not in item[0]]
+            filtered: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
+            rescued_signal_only = 0
+            for item in neural_variants:
+                name, _, _, metrics = item
+                if "signal_only" not in name:
+                    filtered.append(item)
+                    continue
+                if (
+                    metrics.trades >= signal_only_min_trades_unstable
+                    and (metrics.profit_factor >= signal_only_min_pf_unstable or metrics.total_return >= -signal_only_max_loss_unstable)
+                ):
+                    filtered.append(item)
+                    rescued_signal_only += 1
+
             if filtered:
                 print(
-                    "[ORCHESTRATION] Drift guard active: excluding signal-only neural variants "
-                    f"while shadow stability is failing (window={shadow_stability_prev.get('window')}, "
-                    f"avg_ret={shadow_stability_prev.get('avg_ret')}, pass={shadow_stability_prev.get('pass')})."
+                    "[ORCHESTRATION] Drift guard active: constrained signal-only neural variants while shadow "
+                    f"stability is failing (window={shadow_stability_prev.get('window')}, "
+                    f"avg_ret={shadow_stability_prev.get('avg_ret')}, pass={shadow_stability_prev.get('pass')}, "
+                    f"rescued_signal_only={rescued_signal_only})."
                 )
                 neural_variants = filtered
 
@@ -1576,6 +1594,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
         allow_baseline_fallback = os.getenv("NEURAL_ALLOW_BASELINE_FALLBACK", "1") == "1"
         min_neural_test_trades = int(os.getenv("NEURAL_MIN_TEST_TRADES", "6"))
+        fallback_min_return_delta = float(os.getenv("NEURAL_BASELINE_FALLBACK_MIN_RETURN_DELTA", "0.003"))
+        fallback_min_pf_delta = float(os.getenv("NEURAL_BASELINE_FALLBACK_MIN_PF_DELTA", "0.12"))
+        fallback_min_dd_improvement = float(os.getenv("NEURAL_BASELINE_FALLBACK_MIN_DD_IMPROVEMENT", "0.01"))
         # Keep defensive fallback opt-in: baseline has recently underperformed,
         # so forcing it during generic negative drift can amplify losses.
         force_baseline_on_negative_drift = os.getenv("NEURAL_FORCE_BASELINE_ON_NEGATIVE_DRIFT", "0") == "1"
@@ -1594,6 +1615,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             and neural_test.total_return < 0
         )
 
+        baseline_is_safer = bool(
+            (baseline_test.total_return - neural_test.total_return) >= fallback_min_return_delta
+            and (baseline_test.profit_factor - neural_test.profit_factor) >= fallback_min_pf_delta
+            and (baseline_test.max_drawdown - neural_test.max_drawdown) >= fallback_min_dd_improvement
+        )
+
         if forced_defensive_fallback:
             selected_variant = baseline_candidate
             print(
@@ -1602,24 +1629,22 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 f"72h_ret={rolling_72h.get('avg_ret', 0.0):.4f}, neural_ret={neural_test.total_return:.2%}, "
                 f"neural_dnt={neural_test.do_not_trade})."
             )
-        elif (
-            allow_baseline_fallback
-            and neural_degraded
-            and baseline_test.total_return > 0
-            and _variant_key(baseline_candidate) > _variant_key(best_neural)
-        ):
+        elif allow_baseline_fallback and neural_degraded and baseline_is_safer:
             selected_variant = baseline_candidate
             print(
-                "[ORCHESTRATION] Neural mode fallback activated: "
-                f"selected baseline variant '{baseline_variant_name}' over degraded neural candidate "
-                f"(ret={neural_test.total_return:.2%}, trades={neural_test.trades}, "
-                f"dnt={neural_test.do_not_trade}, min_trades={min_neural_test_trades}, "
-                f"baseline_ret={baseline_test.total_return:.2%})."
+                "[ORCHESTRATION] Neural mode fallback activated: selected baseline on PF/DD balance over degraded "
+                f"neural candidate (neural_ret={neural_test.total_return:.2%}, neural_pf={neural_test.profit_factor:.2f}, "
+                f"neural_dd={neural_test.max_drawdown:.2%}, trades={neural_test.trades}, "
+                f"baseline_ret={baseline_test.total_return:.2%}, baseline_pf={baseline_test.profit_factor:.2f}, "
+                f"baseline_dd={baseline_test.max_drawdown:.2%}, min_trades={min_neural_test_trades})."
             )
         else:
             selected_variant = best_neural
     else:
         auto_candidates = list(variant_results)
+        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "3"))
+        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "0.90"))
+        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.003"))
         if severe_short_window_drift:
             signal_only_candidates = [
                 item
@@ -1634,12 +1659,25 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 )
                 auto_candidates = signal_only_candidates
         if disallow_signal_only_when_unstable and stability_failing:
-            filtered = [item for item in auto_candidates if "signal_only" not in item[0]]
+            filtered: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
+            rescued_signal_only = 0
+            for item in auto_candidates:
+                name, _, _, metrics = item
+                if "signal_only" not in name:
+                    filtered.append(item)
+                    continue
+                if (
+                    metrics.trades >= signal_only_min_trades_unstable
+                    and (metrics.profit_factor >= signal_only_min_pf_unstable or metrics.total_return >= -signal_only_max_loss_unstable)
+                ):
+                    filtered.append(item)
+                    rescued_signal_only += 1
             if filtered:
                 print(
-                    "[ORCHESTRATION] Drift guard active (auto mode): excluding signal-only variants "
-                    f"while shadow stability is failing (window={shadow_stability_prev.get('window')}, "
-                    f"avg_ret={shadow_stability_prev.get('avg_ret')}, pass={shadow_stability_prev.get('pass')})."
+                    "[ORCHESTRATION] Drift guard active (auto mode): constrained signal-only variants while "
+                    f"shadow stability is failing (window={shadow_stability_prev.get('window')}, "
+                    f"avg_ret={shadow_stability_prev.get('avg_ret')}, pass={shadow_stability_prev.get('pass')}, "
+                    f"rescued_signal_only={rescued_signal_only})."
                 )
                 auto_candidates = filtered
         selected_variant = max(auto_candidates, key=_variant_key)
