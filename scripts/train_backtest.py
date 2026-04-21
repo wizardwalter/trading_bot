@@ -1530,8 +1530,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
     severe_short_window_drift = bool(
         drift_negative
-        and rolling_24h.get("avg_ret", 0.0) <= -0.015
-        and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.004
+        and rolling_24h.get("avg_ret", 0.0) <= -0.012
+        and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.003
     )
     if severe_short_window_drift and disallow_signal_only_when_unstable:
         print(
@@ -1546,6 +1546,15 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         neural_variants = [item for item in variant_results if item[0] != baseline_variant_name]
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
+
+        if severe_short_window_drift:
+            signal_only_variants = [item for item in neural_variants if "signal_only" in item[0]]
+            if signal_only_variants:
+                print(
+                    "[ORCHESTRATION] Severe drift guard active: prioritizing signal-only neural variants "
+                    f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
+                )
+                neural_variants = signal_only_variants
 
         if disallow_signal_only_when_unstable and stability_failing:
             filtered = [item for item in neural_variants if "signal_only" not in item[0]]
@@ -1600,6 +1609,14 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             selected_variant = best_neural
     else:
         auto_candidates = list(variant_results)
+        if severe_short_window_drift:
+            signal_only_candidates = [item for item in auto_candidates if "signal_only" in item[0]]
+            if signal_only_candidates:
+                print(
+                    "[ORCHESTRATION] Severe drift guard active (auto mode): prioritizing signal-only variants "
+                    f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
+                )
+                auto_candidates = signal_only_candidates
         if disallow_signal_only_when_unstable and stability_failing:
             filtered = [item for item in auto_candidates if "signal_only" not in item[0]]
             if filtered:
