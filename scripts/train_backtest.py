@@ -1533,12 +1533,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and rolling_24h.get("avg_ret", 0.0) <= -0.012
         and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.003
     )
+    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "4"))
     if severe_short_window_drift and disallow_signal_only_when_unstable:
         print(
-            "[ORCHESTRATION] Severe short-window drift detected; allowing signal-only "
-            "neural variant despite stability guard for defensive low-exposure fallback."
+            "[ORCHESTRATION] Severe short-window drift detected; signal-only variants will only "
+            f"override stability guard when they meet min test trades={severe_drift_signal_only_min_trades}."
         )
-        disallow_signal_only_when_unstable = False
 
     if mode_setting == "classic":
         selected_variant = next(item for item in variant_results if item[0] == baseline_variant_name)
@@ -1548,10 +1548,15 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
 
         if severe_short_window_drift:
-            signal_only_variants = [item for item in neural_variants if "signal_only" in item[0]]
+            signal_only_variants = [
+                item
+                for item in neural_variants
+                if "signal_only" in item[0] and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+            ]
             if signal_only_variants:
                 print(
                     "[ORCHESTRATION] Severe drift guard active: prioritizing signal-only neural variants "
+                    f"with >= {severe_drift_signal_only_min_trades} test trades "
                     f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
                 )
                 neural_variants = signal_only_variants
@@ -1610,10 +1615,15 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     else:
         auto_candidates = list(variant_results)
         if severe_short_window_drift:
-            signal_only_candidates = [item for item in auto_candidates if "signal_only" in item[0]]
+            signal_only_candidates = [
+                item
+                for item in auto_candidates
+                if "signal_only" in item[0] and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+            ]
             if signal_only_candidates:
                 print(
                     "[ORCHESTRATION] Severe drift guard active (auto mode): prioritizing signal-only variants "
+                    f"with >= {severe_drift_signal_only_min_trades} test trades "
                     f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
                 )
                 auto_candidates = signal_only_candidates
