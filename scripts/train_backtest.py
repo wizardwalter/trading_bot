@@ -1627,10 +1627,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             and neural_test.total_return < 0
         )
 
+        return_delta = baseline_test.total_return - neural_test.total_return
+        pf_delta = baseline_test.profit_factor - neural_test.profit_factor
+        dd_delta = baseline_test.max_drawdown - neural_test.max_drawdown
+        relaxed_pf_on_severe_drift = bool(
+            severe_short_window_drift
+            and return_delta >= max(0.01, fallback_min_return_delta * 2)
+            and dd_delta >= fallback_min_dd_improvement
+        )
         baseline_is_safer = bool(
-            (baseline_test.total_return - neural_test.total_return) >= fallback_min_return_delta
-            and (baseline_test.profit_factor - neural_test.profit_factor) >= fallback_min_pf_delta
-            and (baseline_test.max_drawdown - neural_test.max_drawdown) >= fallback_min_dd_improvement
+            return_delta >= fallback_min_return_delta
+            and (pf_delta >= fallback_min_pf_delta or relaxed_pf_on_severe_drift)
+            and dd_delta >= fallback_min_dd_improvement
         )
 
         if forced_defensive_fallback:
@@ -1663,12 +1671,28 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 for item in auto_candidates
                 if "signal_only" in item[0] and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
             ]
-            if signal_only_candidates:
-                print(
-                    "[ORCHESTRATION] Severe drift guard active (auto mode): prioritizing signal-only variants "
-                    f"with >= {severe_drift_signal_only_min_trades} test trades "
-                    f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
+            non_signal_candidates = [item for item in auto_candidates if "signal_only" not in item[0]]
+            if signal_only_candidates and non_signal_candidates:
+                best_signal = max(signal_only_candidates, key=_variant_key)
+                best_non_signal = max(non_signal_candidates, key=_variant_key)
+                _, _, _, sig_metrics = best_signal
+                _, _, _, non_sig_metrics = best_non_signal
+                signal_only_clearly_safer = bool(
+                    sig_metrics.total_return >= (non_sig_metrics.total_return + 0.005)
+                    and sig_metrics.max_drawdown >= (non_sig_metrics.max_drawdown - 0.005)
                 )
+                if signal_only_clearly_safer:
+                    print(
+                        "[ORCHESTRATION] Severe drift guard active (auto mode): signal-only variant kept because "
+                        "it materially outperformed non-signal options on return/DD."
+                    )
+                    auto_candidates = signal_only_candidates
+                else:
+                    print(
+                        "[ORCHESTRATION] Severe drift guard active (auto mode): retaining non-signal candidates "
+                        "because signal-only variants did not show clear risk-adjusted improvement."
+                    )
+            elif signal_only_candidates:
                 auto_candidates = signal_only_candidates
         if disallow_signal_only_when_unstable and stability_failing:
             filtered: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
