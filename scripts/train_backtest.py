@@ -1545,7 +1545,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and rolling_24h.get("avg_ret", 0.0) <= -0.012
         and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.003
     )
-    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "6"))
+    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "14"))
+    severe_drift_signal_only_min_pf = float(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_PF", "1.0"))
+    severe_drift_signal_only_min_return = float(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_RETURN", "0.002"))
     if severe_short_window_drift and disallow_signal_only_when_unstable:
         print(
             "[ORCHESTRATION] Severe short-window drift detected; signal-only variants will only "
@@ -1567,12 +1569,20 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             signal_only_variants = [
                 item
                 for item in neural_variants
-                if "signal_only" in item[0] and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+                if (
+                    "signal_only" in item[0]
+                    and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+                    and (
+                        getattr(item[3], "profit_factor", 0.0) >= severe_drift_signal_only_min_pf
+                        or getattr(item[3], "total_return", -1.0) >= severe_drift_signal_only_min_return
+                    )
+                )
             ]
             if signal_only_variants:
                 print(
-                    "[ORCHESTRATION] Severe drift guard active: prioritizing signal-only neural variants "
-                    f"with >= {severe_drift_signal_only_min_trades} test trades "
+                    "[ORCHESTRATION] Severe drift guard active: prioritizing only strong signal-only neural variants "
+                    f"(trades>={severe_drift_signal_only_min_trades}, "
+                    f"pf>={severe_drift_signal_only_min_pf:.2f} or ret>={severe_drift_signal_only_min_return:.2%}) "
                     f"(24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, 72h_ret={rolling_72h.get('avg_ret', 0.0):.4f})."
                 )
                 neural_variants = signal_only_variants
@@ -1677,7 +1687,14 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             signal_only_candidates = [
                 item
                 for item in auto_candidates
-                if "signal_only" in item[0] and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+                if (
+                    "signal_only" in item[0]
+                    and getattr(item[3], "trades", 0) >= severe_drift_signal_only_min_trades
+                    and (
+                        getattr(item[3], "profit_factor", 0.0) >= severe_drift_signal_only_min_pf
+                        or getattr(item[3], "total_return", -1.0) >= severe_drift_signal_only_min_return
+                    )
+                )
             ]
             non_signal_candidates = [item for item in auto_candidates if "signal_only" not in item[0]]
             if signal_only_candidates and non_signal_candidates:
