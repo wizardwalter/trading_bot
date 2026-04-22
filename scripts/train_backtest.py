@@ -1579,11 +1579,13 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
         if disallow_signal_only_when_unstable and stability_failing:
             filtered: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
+            non_signal_variants: list[tuple[str, pd.DataFrame, Metrics, Metrics]] = []
             rescued_signal_only = 0
             for item in neural_variants:
                 name, _, _, metrics = item
                 if "signal_only" not in name:
                     filtered.append(item)
+                    non_signal_variants.append(item)
                     continue
                 if (
                     metrics.trades >= signal_only_min_trades_unstable
@@ -1600,6 +1602,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                     f"rescued_signal_only={rescued_signal_only})."
                 )
                 neural_variants = filtered
+            elif non_signal_variants:
+                print(
+                    "[ORCHESTRATION] Drift guard active: excluded all signal-only neural variants due to "
+                    "failing stability and weak test metrics."
+                )
+                neural_variants = non_signal_variants
 
         best_neural = max(neural_variants, key=_variant_key)
         baseline_candidate = next(item for item in variant_results if item[0] == baseline_variant_name)
