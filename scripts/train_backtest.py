@@ -1561,9 +1561,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         if not neural_variants:
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
 
-        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "3"))
-        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "0.90"))
-        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.003"))
+        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "10"))
+        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "1.00"))
+        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.001"))
 
         if severe_short_window_drift:
             signal_only_variants = [
@@ -1680,9 +1680,9 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             selected_variant = best_neural
     else:
         auto_candidates = list(variant_results)
-        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "3"))
-        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "0.90"))
-        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.003"))
+        signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "10"))
+        signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "1.00"))
+        signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.001"))
         if severe_short_window_drift:
             signal_only_candidates = [
                 item
