@@ -1545,7 +1545,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and rolling_24h.get("avg_ret", 0.0) <= -0.012
         and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.003
     )
-    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "4"))
+    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "6"))
     if severe_short_window_drift and disallow_signal_only_when_unstable:
         print(
             "[ORCHESTRATION] Severe short-window drift detected; signal-only variants will only "
