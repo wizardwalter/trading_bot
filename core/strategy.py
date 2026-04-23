@@ -313,7 +313,9 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
     # current model historically overtrades and bleeds on fees/slippage.
     # When shadow drift is negative, tighten the volatility guard incrementally.
     drift_penalty = float(profile.get("drift_penalty", 0.0))
-    risk_off_vol_threshold = max(0.014, 0.018 - (0.04 * min(max(drift_penalty, 0.0), 0.05)))
+    # Under sustained negative drift, tighten the volatility ceiling a bit more
+    # aggressively so the bot avoids chop-heavy entries.
+    risk_off_vol_threshold = max(0.0135, 0.018 - (0.08 * min(max(drift_penalty, 0.0), 0.05)))
     risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > risk_off_vol_threshold
 
     # Require at least one supportive regime signal for non-rebound buys.
