@@ -1545,7 +1545,10 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and rolling_24h.get("avg_ret", 0.0) <= -0.012
         and (rolling_24h.get("avg_ret", 0.0) - rolling_72h.get("avg_ret", 0.0)) <= -0.003
     )
-    severe_drift_signal_only_min_trades = int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "14"))
+    severe_drift_signal_only_min_trades = max(
+        12,
+        int(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_TEST_TRADES", "14")),
+    )
     severe_drift_signal_only_min_pf = float(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_PF", "1.0"))
     severe_drift_signal_only_min_return = float(os.getenv("NEURAL_SEVERE_DRIFT_SIGNAL_ONLY_MIN_RETURN", "0.002"))
     if severe_short_window_drift and disallow_signal_only_when_unstable:
