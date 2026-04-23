@@ -187,15 +187,15 @@ def _shadow_drift_penalty(symbol: str) -> float:
         default_penalty = 0.04 if broad_deterioration else 0.02
 
         # Add a small severity step when short-horizon decay is materially worse
-        # than medium horizon performance. This tightens entries by up to +1%
+        # than medium horizon performance. This tightens entries by up to +1.5%
         # without fully shutting off signal responsiveness.
         ret_gap = max(avg_ret_72h - avg_ret_24h, 0.0)
         dd_gap = max(avg_dd_72h - avg_dd_24h, 0.0)
         severe_decay = (ret_gap >= 0.0025) and (dd_gap >= 0.0025)
-        penalty = default_penalty + (0.01 if severe_decay else 0.0)
+        penalty = default_penalty + (0.015 if severe_decay else 0.0)
 
         env_penalty = float(os.getenv("BTC_DRIFT_THRESHOLD_PENALTY", str(penalty)))
-        return min(max(env_penalty, 0.0), 0.05)
+        return min(max(env_penalty, 0.0), 0.06)
 
     return 0.0
 
