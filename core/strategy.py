@@ -192,7 +192,11 @@ def _shadow_drift_penalty(symbol: str) -> float:
         ret_gap = max(avg_ret_72h - avg_ret_24h, 0.0)
         dd_gap = max(avg_dd_72h - avg_dd_24h, 0.0)
         severe_decay = (ret_gap >= 0.0025) and (dd_gap >= 0.0025)
-        penalty = default_penalty + (0.015 if severe_decay else 0.0)
+
+        # Add one more gentle step when all windows are materially red so live
+        # execution throttles marginal entries until drift normalizes.
+        sustained_stress = broad_deterioration and (avg_ret_24h <= -0.02) and (avg_dd_24h <= -0.04)
+        penalty = default_penalty + (0.015 if severe_decay else 0.0) + (0.01 if sustained_stress else 0.0)
 
         env_penalty = float(os.getenv("BTC_DRIFT_THRESHOLD_PENALTY", str(penalty)))
         return min(max(env_penalty, 0.0), 0.06)
