@@ -1531,9 +1531,18 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         and rolling_24h.get("avg_ret", 0.0) < rolling_7d.get("avg_ret", 0.0)
         and rolling_24h.get("avg_dd", 0.0) < min(rolling_72h.get("avg_dd", 0.0), rolling_7d.get("avg_dd", 0.0))
     )
-    if drift_negative:
+    medium_term_drift_negative = bool(
+        rolling_72h.get("count", 0) >= 20
+        and rolling_7d.get("count", 0) >= 40
+        and rolling_72h.get("avg_ret", 0.0) < 0
+        and rolling_7d.get("avg_ret", 0.0) < 0
+        and rolling_72h.get("avg_ret", 0.0) < rolling_7d.get("avg_ret", 0.0)
+        and rolling_72h.get("avg_dd", 0.0) < rolling_7d.get("avg_dd", 0.0)
+    )
+    if drift_negative or medium_term_drift_negative:
+        drift_mode = "short-window" if drift_negative else "medium-term"
         print(
-            "[ORCHESTRATION] Rolling drift guard active: "
+            f"[ORCHESTRATION] Rolling drift guard active ({drift_mode}): "
             f"24h_ret={rolling_24h.get('avg_ret', 0.0):.4f}, "
             f"72h_ret={rolling_72h.get('avg_ret', 0.0):.4f}, "
             f"7d_ret={rolling_7d.get('avg_ret', 0.0):.4f}."
@@ -1565,6 +1574,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
             raise RuntimeError("Neural training mode did not produce any ML-backed variants")
 
         signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "10"))
+        if medium_term_drift_negative:
+            signal_only_min_trades_unstable += 2
         signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "1.00"))
         signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.001"))
 
@@ -1684,6 +1695,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     else:
         auto_candidates = list(variant_results)
         signal_only_min_trades_unstable = int(os.getenv("NEURAL_SIGNAL_ONLY_MIN_TEST_TRADES_UNSTABLE", "10"))
+        if medium_term_drift_negative:
+            signal_only_min_trades_unstable += 2
         signal_only_min_pf_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MIN_PF_UNSTABLE", "1.00"))
         signal_only_max_loss_unstable = float(os.getenv("NEURAL_SIGNAL_ONLY_MAX_LOSS_UNSTABLE", "0.001"))
         if severe_short_window_drift:
