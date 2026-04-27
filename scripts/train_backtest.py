@@ -206,20 +206,6 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     volume_z = ((volume - vol_mean) / vol_std).clip(-3, 3).fillna(0.0)
     out["volume_z"] = volume_z
 
-    # Volume-flow features (BTC-focused): capture where big orders are likely flowing.
-    vol_fast = volume.rolling(3).mean()
-    vol_slow = volume.rolling(48).mean().replace(0, np.nan)
-    rel_volume = (vol_fast / vol_slow).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.3, 6.0)
-    impulse_3 = out["Close"].pct_change(3).fillna(0.0)
-    flow_imbalance = (impulse_3 * rel_volume * 40.0).clip(-2.0, 2.0)
-    out["rel_volume"] = rel_volume
-    out["flow_imbalance"] = flow_imbalance
-
-    # High-volume absorption: big volume but weak body often signals trap/absorption.
-    candle_body = (out["Close"] - out.get("Open", out["Close"]).shift(1).fillna(out["Close"]))
-    body_norm = (candle_body.abs() / out["Close"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    out["absorption"] = (rel_volume * (1.0 - np.tanh(body_norm * 180.0))).clip(0.0, 3.0)
-
     high_low = out["High"] - out["Low"]
     prev_close = out["Close"].shift(1)
     true_range = pd.concat([
@@ -270,14 +256,12 @@ def features(df: pd.DataFrame) -> pd.DataFrame:
     out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
 
     out["score"] = (
-        0.23 * trend
-        + 0.10 * m20
+        0.28 * trend
+        + 0.12 * m20
         + 0.05 * m3
-        + 0.24 * rsi_comp
+        + 0.32 * rsi_comp
         + 0.10 * out["mtf_trend_1h"].fillna(0.0)
         + 0.08 * out["mtf_trend_4h"].fillna(0.0)
-        + 0.14 * np.tanh(out["flow_imbalance"].fillna(0.0) / 1.5)
-        - 0.06 * np.tanh(out["absorption"].fillna(0.0) / 1.2)
     )
     out["score_raw"] = out["score"]
     out["trend"] = trend
@@ -316,9 +300,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     atr_pct = df["atr_pct"].values
     volume_bias = df["volume_bias"].values
     range_score = df["range_score"].values
-    rel_volume = df["rel_volume"].values if "rel_volume" in df.columns else np.ones(len(df))
-    flow_imbalance = df["flow_imbalance"].values if "flow_imbalance" in df.columns else np.zeros(len(df))
-    absorption = df["absorption"].values if "absorption" in df.columns else np.zeros(len(df))
 
     if "score_ml" in df.columns:
         score_ml = df["score_ml"].values
@@ -388,10 +369,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
     bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20)
     bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20)
 
-    flow_long_ok = ((flow_imbalance > -0.12) & (rel_volume >= 0.85)) | (trend > 0.18)
-    flow_short_ok = ((flow_imbalance < 0.12) & (rel_volume >= 0.85)) | (trend < -0.18)
-    absorption_block = (absorption > 1.65) & (np.abs(trend) < 0.22)
-
     ml_raw_abs = np.abs(score_ml_raw)
     low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
     weak_trend = np.abs(trend) < 0.05
@@ -415,8 +392,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_long
         & (~high_vol_penalty_long)
         & (long_ml_gate | long_override)
-        & flow_long_ok
-        & (~absorption_block)
         & (~do_not_trade_filter)
     )
     short_entry = (
@@ -427,8 +402,6 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & range_ok_short
         & (~high_vol_penalty_short)
         & (short_ml_gate | short_override)
-        & flow_short_ok
-        & (~absorption_block)
         & (~do_not_trade_filter)
     )
 
@@ -1269,9 +1242,6 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         "macd_hist",
         "price_momentum",
         "volume_trend",
-        "rel_volume",
-        "flow_imbalance",
-        "absorption",
         "mtf_trend_1h",
         "mtf_trend_4h",
         "regime_trend",
