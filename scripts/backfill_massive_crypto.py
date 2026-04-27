@@ -56,6 +56,11 @@ def fetch_range(ticker: str, mult: int, span: str, start: date, end: date) -> li
         for attempt in range(1, 7):
             try:
                 r = requests.get(req_url, params=req_params, timeout=45)
+                if r.status_code == 429:
+                    # Respect provider rate limits with longer backoff.
+                    wait_s = min(20 + (attempt * 8), 60)
+                    time.sleep(wait_s)
+                    raise RuntimeError(f"HTTP 429: rate limited, waited {wait_s}s")
                 if r.status_code >= 400:
                     snippet = r.text[:240]
                     raise RuntimeError(f"HTTP {r.status_code}: {snippet}")
