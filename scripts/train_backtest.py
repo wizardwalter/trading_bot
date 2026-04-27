@@ -73,7 +73,7 @@ def _download_from_db(symbol: str, interval: str, period: str) -> pd.DataFrame:
         out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
 
         # Freshness guard: if DB feed is stale, force fallback to live providers.
-        max_stale_hours = float(os.getenv("TRAINING_DB_MAX_STALE_HOURS", "12"))
+        max_stale_hours = float(os.getenv("TRAINING_DB_MAX_STALE_HOURS", "36"))
         latest_ts = out["timestamp"].max()
         if pd.notna(latest_ts):
             stale_cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=max_stale_hours)
