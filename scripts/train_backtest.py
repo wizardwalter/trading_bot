@@ -291,6 +291,7 @@ class Metrics:
 
 
 def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
+    long_only_mode = str(os.getenv("TRAINING_LONG_ONLY", "1")).strip().lower() in {"1", "true", "yes", "on"}
     score = df["score"].values
     rsi = df["rsi"].values
     m3 = df["m3"].values
@@ -404,6 +405,8 @@ def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
         & (short_ml_gate | short_override)
         & (~do_not_trade_filter)
     )
+    if long_only_mode:
+        short_entry = np.zeros_like(short_entry, dtype=bool)
 
     long_exit = (
         (score < -0.011)
