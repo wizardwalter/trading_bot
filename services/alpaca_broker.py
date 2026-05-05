@@ -174,18 +174,24 @@ class AlpacaBroker:
         r.raise_for_status()
         return r.json()
 
+    def get_position(self, symbol: str) -> dict | None:
+        symbol = _to_alpaca_symbol(symbol)
+        r = self._request("GET", f"/v2/positions/{symbol}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
     def get_buying_power(self) -> float:
         acct = self.get_account()
         return float(acct.get("buying_power") or acct.get("equity") or 0.0)
 
     def get_position_qty(self, symbol: str) -> float:
-        symbol = _to_alpaca_symbol(symbol)
         try:
-            r = self._request("GET", f"/v2/positions/{symbol}")
-            if r.status_code == 404:
+            position = self.get_position(symbol)
+            if not position:
                 return 0.0
-            r.raise_for_status()
-            return float(r.json().get("qty", 0.0))
+            return float(position.get("qty", 0.0))
         except Exception:
             return 0.0
 

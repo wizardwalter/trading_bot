@@ -28,12 +28,12 @@ try:
 except ImportError:  # pragma: no cover - exercised on the VM where torch exists.
     torch = None
 
+from core.scalper_engine import config_as_dict, load_btc_scalper_config, run_backtest
 from discord.notify import send_training_update
 from ml.signal_engine import (
     ARTIFACT_VERSION,
     DEFAULT_SIGNAL_FEATURE_COLUMNS,
     compute_market_features,
-    compute_target_position,
 )
 from services.market_data import (
     download_from_db as shared_download_from_db,
@@ -102,7 +102,7 @@ def _infer_bar_seconds(df: pd.DataFrame, fallback: int = 300) -> int:
 
 
 def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
-    return compute_target_position(df, threshold)
+    raise NotImplementedError("Managed BTC scalper uses run_backtest() instead of target-position vectors")
 
 
 def simulate(
@@ -127,61 +127,18 @@ def simulate(
             do_not_trade=True,
         )
 
-    fee = fee_bps / 10_000
-    slippage = slippage_bps / 10_000
-
-    position = _target_position(df, threshold).astype(float)
-    bar_seconds = _infer_bar_seconds(df)
-
-    # Position applies from the next bar onward, plus latency delay approximation.
-    position = pd.Series(position).shift(1).fillna(0)
-    delay_bars = max(0, int(np.ceil(float(latency_ms) / (bar_seconds * 1000))))
-    if delay_bars > 0:
-        position = position.shift(delay_bars).fillna(0)
-    position = position.values
-
-    rets = df["Close"].pct_change().fillna(0).values
-    strat = position * rets
-
-    turns = np.abs(np.diff(np.r_[0, position]))
-    costs = turns * (fee + slippage)
-    strat = strat - costs
-
-    eq = (1 + pd.Series(strat)).cumprod()
-    total_return = float(eq.iloc[-1] - 1)
-
-    # Compute trade-level PnL over contiguous non-zero position regimes.
-    trade_rets: list[float] = []
-    active = False
-    active_side = 0.0
-    acc = 0.0
-    for i in range(len(position)):
-        side = position[i]
-        r = float(strat[i])
-
-        if not active and side != 0:
-            active = True
-            active_side = side
-            acc = r
-            continue
-
-        if active:
-            if side == 0:
-                acc += r
-                trade_rets.append(acc)
-                active = False
-                active_side = 0.0
-                acc = 0.0
-            elif side != active_side:
-                # Side flip: close prior trade and start the new one on the same bar.
-                trade_rets.append(acc)
-                active_side = side
-                acc = r
-            else:
-                acc += r
-
-    if active:
-        trade_rets.append(acc)
+    # `latency_ms` is kept for API compatibility, but at 5m-bar scale it is not
+    # a material differentiator unless you move to sub-minute execution data.
+    _ = latency_ms
+    bt = run_backtest(
+        df,
+        symbol=os.getenv("TRAINING_SYMBOL", "BTC-USD"),
+        threshold=threshold,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    trade_rets = list(bt.trade_returns)
+    total_return = float(bt.total_return)
 
     trades = len(trade_rets)
     wins = [x for x in trade_rets if x > 0]
@@ -196,7 +153,10 @@ def simulate(
     avg_loss = abs(float(np.mean(losses))) if losses else 0.0
     win_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else (9.99 if avg_win > 0 else 0.0)
 
-    vol = float(pd.Series(strat).std())
+    eq = pd.Series(bt.equity_curve, dtype=float)
+    strat = eq.pct_change().fillna(0.0)
+    bar_seconds = _infer_bar_seconds(df)
+    vol = float(strat.std())
     bars_per_year = (365.25 * 24 * 60 * 60) / max(bar_seconds, 1)
     sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(bars_per_year)) if vol > 0 else 0.0
 
@@ -467,14 +427,18 @@ def pick_best(train_df: pd.DataFrame) -> Metrics:
 
         return scored_local
 
-    coarse = np.arange(0.05, 0.71, 0.01)
+    # The managed BTC scalper’s setup score lives in a tighter band than the
+    # old signal-flipping bot. Searching a narrower threshold range improves
+    # training speed and avoids spending cycles on effectively unreachable
+    # thresholds.
+    coarse = np.arange(0.08, 0.33, 0.01)
     scored = evaluate_candidates(coarse)
 
     top_seed = sorted(scored, key=lambda x: x[0], reverse=True)[:4]
     centers = [m.threshold for _, m, _ in top_seed]
     refined_vals: set[float] = set()
     for c in centers:
-        for th in np.arange(max(0.03, c - 0.03), min(0.80, c + 0.03) + 1e-9, 0.002):
+        for th in np.arange(max(0.06, c - 0.03), min(0.40, c + 0.03) + 1e-9, 0.002):
             refined_vals.add(round(float(th), 3))
     refined = np.array(sorted(refined_vals), dtype=float)
     if len(refined) > 0:
@@ -1542,6 +1506,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         LIVE_SIGNAL_ARTIFACT_PATH.unlink()
         print(f"[ORCHESTRATION] Cleared stale live signal artifact at {LIVE_SIGNAL_ARTIFACT_PATH}")
 
+    scalper_config = config_as_dict(load_btc_scalper_config(best.threshold))
     result = {
         "symbol": symbol,
         "interval": interval,
@@ -1567,6 +1532,7 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         "training_profile": resolved_profile,
         "training_profile_requested": mode_setting,
         "training_label": TRAINING_LABEL or resolved_profile,
+        "scalper_config": scalper_config,
         "live_signal_artifact": {
             "path": str(LIVE_SIGNAL_ARTIFACT_PATH),
             "saved": live_signal_artifact_saved,
