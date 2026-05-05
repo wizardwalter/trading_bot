@@ -54,7 +54,7 @@ def log_trade(ticker, action, price, quantity, signal_strength=0.0, reason=""):
             return
 
 
-def get_position_qty(ticker: str) -> int:
+def get_position_qty(ticker: str) -> float:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -65,7 +65,7 @@ def get_position_qty(ticker: str) -> int:
                 """,
                 (ticker,),
             )
-            return int(cur.fetchone()[0] or 0)
+            return float(cur.fetchone()[0] or 0.0)
 
 
 def get_portfolio_equity(latest_prices: dict[str, float]) -> float:
@@ -76,10 +76,10 @@ def get_portfolio_equity(latest_prices: dict[str, float]) -> float:
             cur.execute("SELECT ticker, action, price, quantity FROM trades ORDER BY timestamp ASC")
             rows = cur.fetchall()
 
-    positions: dict[str, int] = {}
+    positions: dict[str, float] = {}
 
     for ticker, action, price, quantity in rows:
-        qty = int(quantity)
+        qty = float(quantity)
         px = float(price)
         if action == "buy":
             cash -= px * qty

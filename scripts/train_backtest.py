@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,11 +12,9 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import joblib
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import torch
-from services.alpaca_candles import fetch_crypto_bars
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -24,11 +23,27 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised on the VM where torch exists.
+    torch = None
+
 from discord.notify import send_training_update
-from data.database import get_all_candles
+from ml.signal_engine import (
+    ARTIFACT_VERSION,
+    DEFAULT_SIGNAL_FEATURE_COLUMNS,
+    compute_market_features,
+    compute_target_position,
+)
+from services.market_data import (
+    download_from_db as shared_download_from_db,
+    download_market_data,
+    period_to_days as shared_period_to_days,
+)
 
 OUT_DIR = Path("data/backtests")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+LIVE_SIGNAL_ARTIFACT_PATH = Path(os.getenv("LIVE_SIGNAL_ARTIFACT_PATH", "models/live_signal_artifact.pkl"))
 
 TRAINING_MODE = (os.getenv("TRAINING_MODE") or "auto").strip().lower()
 if TRAINING_MODE not in {"auto", "classic", "neural"}:
@@ -37,241 +52,27 @@ TRAINING_LABEL = (os.getenv("TRAINING_LABEL") or os.getenv("TRAINING_VARIANT") o
 
 
 def _period_to_days(period: str) -> int:
-    p = str(period).strip().lower()
-    if p.endswith("d"):
-        return max(int(p[:-1]), 1)
-    if p.endswith("mo"):
-        return max(int(p[:-2]) * 30, 30)
-    if p.endswith("y"):
-        return max(int(p[:-1]) * 365, 365)
-    return 60
+    return shared_period_to_days(period)
 
 
 def _download_from_db(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = get_all_candles(symbol, interval)
-    if df.empty:
-        raise RuntimeError(f"DB has no candles for {symbol} {interval}")
-
-    # Normalize schema from DB helper to expected OHLCV names.
-    out = df.copy()
-    if "open" in out.columns:
-        out.rename(
-            columns={
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-            },
-            inplace=True,
-        )
-
-    # Keep recent window requested by training period.
-    days = _period_to_days(period)
-    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=days)
-    if "timestamp" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-
-        # Freshness guard: if DB feed is stale, force fallback to live providers.
-        max_stale_hours = float(os.getenv("TRAINING_DB_MAX_STALE_HOURS", "36"))
-        latest_ts = out["timestamp"].max()
-        if pd.notna(latest_ts):
-            stale_cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=max_stale_hours)
-            if latest_ts < stale_cutoff:
-                raise RuntimeError(
-                    f"DB candles stale for {symbol} {interval}: latest={latest_ts}, "
-                    f"max_stale_hours={max_stale_hours}"
-                )
-
-        out = out[out["timestamp"] >= cutoff]
-    elif isinstance(out.index, pd.DatetimeIndex):
-        out = out[out.index >= cutoff]
-
-    cols = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in cols if c not in out.columns]
-    if missing:
-        raise RuntimeError(f"DB candles missing columns: {missing}")
-
-    out = out[cols].copy()
-    for c in cols:
-        out[c] = pd.to_numeric(out[c], errors='coerce')
-    out = out.dropna().copy()
-    if out.empty:
-        raise RuntimeError(f"DB candles empty for {symbol} {interval} after period filter")
-    return out
+    return shared_download_from_db(symbol=symbol, interval=interval, period=period)
 
 
 def download(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", retries: int = 4) -> pd.DataFrame:
-    """Fetch training market data.
-
-    Priority:
-    1) DB candles (Massive/Polygon historical backfill)
-    2) Alpaca crypto data for BTC (execution-aligned)
-    3) yfinance fallback for robustness
-    """
-    source_pref = (os.getenv("TRAINING_DATA_SOURCE") or "db-first").strip().lower()
-
-    if source_pref in {"db", "db-first", "auto"}:
-        try:
-            db_df = _download_from_db(symbol=symbol, interval=interval, period=period)
-            print(f"Using DB market data for training: symbol={symbol}, interval={interval}, rows={len(db_df)}")
-            return db_df
-        except Exception as e:
-            print(f"DB market data unavailable for training, falling back: {e}")
-            if source_pref == "db":
-                raise
-
-    # Prefer Alpaca for BTC training so data distribution better matches execution.
-    use_alpaca_first = symbol.upper() in {"BTC-USD", "BTC/USD", "BTCUSD"}
-    if use_alpaca_first:
-        tf_map = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour"}
-        timeframe = tf_map.get(interval, "5Min")
-        lookback_days = 60
-        if period.endswith("d"):
-            try:
-                lookback_days = int(period[:-1])
-            except Exception:
-                lookback_days = 60
-        lookback_days = max(lookback_days, int(os.getenv("TRAINING_MIN_LOOKBACK_DAYS", "180")))
-
-        try:
-            alpaca_symbol = "BTC/USD"
-            df = fetch_crypto_bars(symbol=alpaca_symbol, timeframe=timeframe, lookback_days=lookback_days)
-            cleaned = df.dropna().copy()
-            if not cleaned.empty:
-                print(f"Using Alpaca market data for training: symbol={alpaca_symbol}, timeframe={timeframe}, rows={len(cleaned)}")
-                return cleaned
-        except Exception as e:
-            print(f"Alpaca market data unavailable, falling back to yfinance: {e}")
-
-    # yfinance intraday windows are capped (e.g., 5m ~= last 60 days), so clamp fallback period.
-    yf_period = period
-    intraday_intervals = {"1m", "2m", "5m", "15m", "30m", "60m", "90m"}
-    if interval in intraday_intervals and str(period).endswith("d"):
-        try:
-            if int(str(period)[:-1]) > 60:
-                yf_period = "60d"
-        except Exception:
-            yf_period = "60d"
-
-    last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            df = yf.download(symbol, interval=interval, period=yf_period, progress=False, threads=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-            cleaned = df.dropna().copy()
-            if cleaned.empty:
-                raise ValueError(f"No market data returned for {symbol}")
-            if yf_period != period:
-                print(f"Using yfinance fallback period={yf_period} for interval={interval} (requested {period})")
-            return cleaned
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(0.6 * attempt)
-
-    raise RuntimeError(f"download failed for {symbol} after {retries} attempts: {last_err}")
+    return download_market_data(
+        symbol=symbol,
+        interval=interval,
+        period=period,
+        retries=retries,
+        source_pref=os.getenv("TRAINING_DATA_SOURCE"),
+    )
 
 
 def features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # Base features
-    out["ema_fast"] = out["Close"].ewm(span=12, adjust=False).mean()
-    out["ema_slow"] = out["Close"].ewm(span=26, adjust=False).mean()
-
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    out["rsi"] = 100 - (100 / (1 + rs))
-
-    out["ret_3"] = out["Close"].pct_change(3)
-    out["ret_20"] = out["Close"].pct_change(20)
-    out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
-    out["volatility"] = out["hl_spread"].rolling(20).mean().fillna(0.002)
-
-    # Additional features: volume, volume changes, multi-timeframe
-    out["ema_ratio"] = ((out["Close"] / out["ema_slow"]) - 1).clip(-0.2, 0.2)
-    out["macd_hist"] = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-0.2, 0.2)
-    out["price_momentum"] = out["Close"].pct_change().rolling(6).mean().clip(-0.05, 0.05)
-
-    vol_growth = out["Volume"].pct_change(36).replace([np.inf, -np.inf], np.nan)
-    out["volume_trend"] = vol_growth.ewm(span=24, adjust=False).mean().clip(-4, 4).fillna(0.0)
-
-    volume = out["Volume"].ffill()
-    vol_mean = volume.rolling(96).mean()
-    vol_std = volume.rolling(96).std().replace(0, np.nan)
-    volume_z = ((volume - vol_mean) / vol_std).clip(-3, 3).fillna(0.0)
-    out["volume_z"] = volume_z
-
-    high_low = out["High"] - out["Low"]
-    prev_close = out["Close"].shift(1)
-    true_range = pd.concat([
-        high_low,
-        (out["High"] - prev_close).abs(),
-        (out["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = true_range.rolling(48).mean()
-    out["atr_pct"] = (atr / out["Close"]).fillna((high_low / out["Close"]).rolling(12).mean()).fillna(0.004)
-
-    intraday_position = ((out["Close"] - out["Low"]) / (high_low.replace(0, np.nan))).clip(0, 1) - 0.5
-    out["range_score"] = intraday_position.rolling(12).mean().fillna(0.0)
-
-    # Multi-timeframe signals: add moving averages with longer windows
-    out["ema_fast_2"] = out["Close"].ewm(span=24, adjust=False).mean()
-    out["ema_slow_2"] = out["Close"].ewm(span=52, adjust=False).mean()
-
-    # Multi-timeframe context proxies (derived from 5m stream)
-    out["ret_1h"] = out["Close"].pct_change(12)
-    out["ret_4h"] = out["Close"].pct_change(48)
-    out["mtf_trend_1h"] = (out["ret_1h"] * 8.0).clip(-1, 1)
-    out["mtf_trend_4h"] = (out["ret_4h"] * 4.0).clip(-1, 1)
-
-    trend = ((out["ema_fast"] - out["ema_slow"]) / out["Close"]).clip(-1, 1) * 220
-    trend = trend.clip(-1, 1)
-    m20 = (out["ret_20"] * 25).clip(-1, 1)
-    m3 = (out["ret_3"] * 35).clip(-1, 1)
-
-    rsi_comp = np.where(out["rsi"] < 33, 0.8, np.where(out["rsi"] > 70, -0.8, 0.0))
-    volume_bias = np.tanh(out["volume_z"].clip(-3, 3) / 1.8)
-    range_component = out["range_score"].clip(-1, 1)
-
-    # Regime/time features
-    if isinstance(out.index, pd.DatetimeIndex):
-        hour = out.index.hour
-        dow = out.index.dayofweek
-    else:
-        hour = pd.Series(0, index=out.index)
-        dow = pd.Series(0, index=out.index)
-    out["hour_sin"] = np.sin((2 * np.pi * hour) / 24.0)
-    out["hour_cos"] = np.cos((2 * np.pi * hour) / 24.0)
-    out["dow_sin"] = np.sin((2 * np.pi * dow) / 7.0)
-    out["dow_cos"] = np.cos((2 * np.pi * dow) / 7.0)
-
-    trend_abs = trend.abs()
-    out["regime_trend"] = (trend_abs > trend_abs.quantile(0.70)).astype(float)
-    out["regime_chop"] = (trend_abs < trend_abs.quantile(0.35)).astype(float)
-    out["regime_high_vol"] = (out["atr_pct"] > out["atr_pct"].quantile(0.80)).astype(float)
-
-    out["score"] = (
-        0.28 * trend
-        + 0.12 * m20
-        + 0.05 * m3
-        + 0.32 * rsi_comp
-        + 0.10 * out["mtf_trend_1h"].fillna(0.0)
-        + 0.08 * out["mtf_trend_4h"].fillna(0.0)
-    )
-    out["score_raw"] = out["score"]
-    out["trend"] = trend
-    out["m3"] = m3
-    out["m20"] = m20
-    out["volume_bias"] = volume_bias
-    out["range_score"] = range_component
-
-    out = out.dropna().copy()
-    return out
+    # Training and live execution must stay on the same feature contract or the
+    # backtest results are not transferable to paper/live trading.
+    return compute_market_features(df)
 
 
 
@@ -290,170 +91,18 @@ class Metrics:
     do_not_trade: bool
 
 
+def _infer_bar_seconds(df: pd.DataFrame, fallback: int = 300) -> int:
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df.index) < 2:
+        return fallback
+    deltas = pd.Series(df.index).diff().dropna().dt.total_seconds()
+    if deltas.empty:
+        return fallback
+    bar_seconds = int(deltas.median())
+    return max(bar_seconds, 1)
+
+
 def _target_position(df: pd.DataFrame, threshold: float) -> np.ndarray:
-    long_only_mode = str(os.getenv("TRAINING_LONG_ONLY", "1")).strip().lower() in {"1", "true", "yes", "on"}
-    score = df["score"].values
-    rsi = df["rsi"].values
-    m3 = df["m3"].values
-    m20 = df["m20"].values
-    trend = df["trend"].values
-    vol = df["volatility"].values
-    atr_pct = df["atr_pct"].values
-    volume_bias = df["volume_bias"].values
-    range_score = df["range_score"].values
-
-    if "score_ml" in df.columns:
-        score_ml = df["score_ml"].values
-    else:
-        score_ml = score
-    if "score_ml_raw" in df.columns:
-        score_ml_raw = df["score_ml_raw"].values
-    else:
-        score_ml_raw = score_ml
-
-    exit_cooldown_bars = 3
-    flip_cooldown_bars = 1
-
-    buy_threshold = threshold + np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
-    sell_threshold = -threshold - np.clip((vol - 0.01) * 8.0, 0.0, 0.10)
-
-    atr_rel = np.maximum(0.0, atr_pct - np.nanpercentile(atr_pct, 70))
-    atr_boost = np.clip(atr_rel * 12.0, 0.0, 0.12)
-    buy_threshold = buy_threshold + atr_boost
-    sell_threshold = sell_threshold - atr_boost
-
-    # Regime-adaptive thresholding: tighter in chop/high-vol, looser in strong trend.
-    trend_abs = np.abs(trend)
-    chop_regime = trend_abs < np.nanpercentile(trend_abs, 35)
-    strong_trend = trend_abs > np.nanpercentile(trend_abs, 75)
-    extreme_vol = atr_pct > np.nanpercentile(atr_pct, 97)
-
-    buy_threshold = buy_threshold + np.where(chop_regime, 0.02, 0.0) + np.where(extreme_vol, 0.03, 0.0)
-    sell_threshold = sell_threshold - np.where(chop_regime, 0.02, 0.0) - np.where(extreme_vol, 0.03, 0.0)
-    buy_threshold = buy_threshold - np.where(strong_trend & (trend > 0), 0.015, 0.0)
-    sell_threshold = sell_threshold + np.where(strong_trend & (trend < 0), 0.015, 0.0)
-
-    long_relief = (
-        np.clip(volume_bias - 0.2, 0.0, 1.0) * 0.02
-        + np.clip(range_score, 0.0, 0.4) * 0.02
-    )
-    short_relief = (
-        np.clip(-0.2 - volume_bias, 0.0, 1.0) * 0.02
-        + np.clip(-range_score, 0.0, 0.4) * 0.02
-    )
-    buy_threshold = buy_threshold - long_relief
-    sell_threshold = sell_threshold + short_relief
-
-    # Tuned thresholds: slightly later overbought filtering and deeper oversold allowance.
-    overbought = rsi > 71
-    oversold = rsi < 19
-
-    # Reduce entries during volatile chop unless directional conviction is strong.
-    vol_guard = vol <= np.nanpercentile(vol, 85)
-    high_vol_regime = atr_pct >= np.nanpercentile(atr_pct, 94)
-    high_vol_penalty_long = high_vol_regime & (volume_bias < 0.15)
-    high_vol_penalty_short = high_vol_regime & (volume_bias > -0.15)
-
-    range_ok_long = range_score > -0.05
-    range_ok_short = range_score < 0.02
-
-    ml_bias = max(0.02, float(threshold) * 0.22)
-    ml_relief = np.clip(volume_bias * 0.01, -0.02, 0.02)
-    long_ml_gate = score_ml > (ml_bias - ml_relief)
-    short_ml_gate = score_ml < (-ml_bias - ml_relief)
-    long_override = score > (buy_threshold + 0.05)
-    short_override = score < (sell_threshold - 0.05)
-
-    mtf_1h = df["mtf_trend_1h"].values if "mtf_trend_1h" in df.columns else np.zeros(len(df))
-    mtf_4h = df["mtf_trend_4h"].values if "mtf_trend_4h" in df.columns else np.zeros(len(df))
-
-    bullish_confirmation = (trend > -0.01) & (m20 > -0.05) & (m3 > -0.13) & (mtf_1h > -0.15) & (mtf_4h > -0.20)
-    bearish_confirmation = (trend < 0.01) & (m20 < 0.05) & (m3 < 0.13) & (mtf_1h < 0.15) & (mtf_4h < 0.20)
-
-    ml_raw_abs = np.abs(score_ml_raw)
-    low_confidence = ml_raw_abs < np.maximum(0.06, threshold * 0.20)
-    weak_trend = np.abs(trend) < 0.05
-    volatility_block = atr_pct > np.nanpercentile(atr_pct, 97)
-
-    if "meta_take_prob" in df.columns:
-        meta_take_prob = np.clip(df["meta_take_prob"].values, 0.001, 0.999)
-    else:
-        meta_take_prob = np.clip((score_ml + 1.0) * 0.5, 0.001, 0.999)
-    min_take_prob = np.where(high_vol_regime, 0.60, 0.53)
-    min_take_prob = np.where(np.abs(trend) > 0.25, min_take_prob - 0.03, min_take_prob)
-    meta_skip = meta_take_prob < min_take_prob
-
-    do_not_trade_filter = low_confidence | (weak_trend & (~vol_guard)) | volatility_block | meta_skip
-
-    long_entry = (
-        (score > buy_threshold)
-        & bullish_confirmation
-        & (~overbought)
-        & (vol_guard | (trend > 0.20) | (volume_bias > 0.35))
-        & range_ok_long
-        & (~high_vol_penalty_long)
-        & (long_ml_gate | long_override)
-        & (~do_not_trade_filter)
-    )
-    short_entry = (
-        (score < sell_threshold)
-        & bearish_confirmation
-        & (~oversold)
-        & (vol_guard | (trend < -0.20) | (volume_bias < -0.35))
-        & range_ok_short
-        & (~high_vol_penalty_short)
-        & (short_ml_gate | short_override)
-        & (~do_not_trade_filter)
-    )
-    if long_only_mode:
-        short_entry = np.zeros_like(short_entry, dtype=bool)
-
-    long_exit = (
-        (score < -0.011)
-        | (overbought & (m3 < 0.08))
-        | ((trend < -0.08) & (m3 < -0.15))
-        | (high_vol_regime & (range_score < -0.02))
-        | (range_score < -0.18)
-    )
-    short_exit = (
-        (score > 0.008)
-        | (oversold & (m3 > -0.08))
-        | ((trend > 0.08) & (m3 > 0.15))
-        | (high_vol_regime & (range_score > 0.02))
-        | (range_score > 0.18)
-    )
-
-    position = np.zeros(len(df), dtype=np.int8)
-    state = 0
-    cooldown = 0
-
-    for i in range(len(df)):
-        if cooldown > 0:
-            cooldown -= 1
-
-        if state == 0:
-            if cooldown == 0 and long_entry[i]:
-                state = 1
-            elif cooldown == 0 and short_entry[i]:
-                state = -1
-        elif state == 1:
-            if long_exit[i]:
-                state = 0
-                cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif short_entry[i]:
-                state = -1
-                cooldown = flip_cooldown_bars
-        elif state == -1:
-            if short_exit[i]:
-                state = 0
-                cooldown = exit_cooldown_bars + (2 if high_vol_regime[i] else 0)
-            elif long_entry[i]:
-                state = 1
-                cooldown = flip_cooldown_bars
-
-        position[i] = state
-
-    return position
+    return compute_target_position(df, threshold)
 
 
 def simulate(
@@ -482,10 +131,11 @@ def simulate(
     slippage = slippage_bps / 10_000
 
     position = _target_position(df, threshold).astype(float)
+    bar_seconds = _infer_bar_seconds(df)
 
     # Position applies from the next bar onward, plus latency delay approximation.
     position = pd.Series(position).shift(1).fillna(0)
-    delay_bars = max(0, int(np.ceil(float(latency_ms) / (5 * 60 * 1000))))
+    delay_bars = max(0, int(np.ceil(float(latency_ms) / (bar_seconds * 1000))))
     if delay_bars > 0:
         position = position.shift(delay_bars).fillna(0)
     position = position.values
@@ -547,7 +197,8 @@ def simulate(
     win_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else (9.99 if avg_win > 0 else 0.0)
 
     vol = float(pd.Series(strat).std())
-    sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(252 * 24 * 12)) if vol > 0 else 0.0
+    bars_per_year = (365.25 * 24 * 60 * 60) / max(bar_seconds, 1)
+    sharpe_like = float((pd.Series(strat).mean() / vol) * np.sqrt(bars_per_year)) if vol > 0 else 0.0
 
     rolling_max = eq.cummax()
     dd = (eq / rolling_max) - 1
@@ -941,8 +592,15 @@ def _build_webhook_metrics(symbol: str, interval: str, period: str, mode: str, t
     return msg
 
 
-from ml.neural_model import NeuralSequenceModel, SequenceDataset, train_neural_model, neural_inference
-from torch.utils.data import DataLoader
+if torch is not None:
+    from ml.neural_model import NeuralSequenceModel, SequenceDataset, train_neural_model, neural_inference
+    from torch.utils.data import DataLoader
+else:  # pragma: no cover - this branch is intentionally used on lightweight boxes.
+    NeuralSequenceModel = None
+    SequenceDataset = None
+    train_neural_model = None
+    neural_inference = None
+    DataLoader = None
 
 def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_cols: list[str]) -> dict[str, Any] | None:
     if len(df) <= horizon or train_rows <= horizon:
@@ -1068,84 +726,88 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
             }
         )
 
-    # Neural candidate training and evaluation
-    try:
-        neural_model = NeuralSequenceModel(input_dim=len(feature_cols))
-        sequence_length = 12
-
-        target = df["Close"].pct_change(horizon).shift(-horizon)
-        label = (target > 0).astype(int)
-        valid_mask = label.notna().to_numpy().copy()
-        valid_mask[-horizon:] = False
-
-        train_mask = np.zeros(len(df), dtype=bool)
-        train_mask[:train_rows] = True
-        train_mask &= valid_mask
-
-        train_idx = np.flatnonzero(train_mask)
-        if train_idx.size < 320:
-            raise ValueError("Insufficient training data for neural model")
-
-        val_size = max(int(train_idx.size * 0.2), 120)
-        if val_size >= train_idx.size:
-            raise ValueError("Insufficient validation data for neural model")
-
-        core_idx = train_idx[:-val_size]
-        val_idx = train_idx[-val_size:]
-
-        feat_df = df[feature_cols]
-        label_series = label
-
-        X_core = feat_df.iloc[core_idx]
-        y_core = label_series.iloc[core_idx]
-
-        X_val = feat_df.iloc[val_idx]
-        y_val = label_series.iloc[val_idx]
-
-        train_dataset = SequenceDataset(X_core, y_core, sequence_length=sequence_length)
-        val_dataset = SequenceDataset(X_val, y_val, sequence_length=sequence_length)
-
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        trained_model = train_neural_model(
-            neural_model, train_loader, val_loader, epochs=10, lr=0.001, device=device
-        )
-
-        val_features = feat_df.iloc[val_idx].values
-        preds = neural_inference(trained_model, val_features, sequence_length=sequence_length, device=device)
-
-        y_val_seq = y_val[sequence_length:]
-        auc = roc_auc_score(y_val_seq, preds)
-        pred_labels = (preds >= 0.5).astype(int)
-        acc = accuracy_score(y_val_seq, pred_labels)
-
-        calibrator = None
+    # Neural sequence models are optional. Classic/sklearn training must still
+    # run on boxes where torch is intentionally unavailable.
+    if torch is not None and NeuralSequenceModel is not None and DataLoader is not None:
         try:
-            calibrator = IsotonicRegression(out_of_bounds="clip")
-            calibrator.fit(preds, np.asarray(y_val_seq, dtype=float))
-            preds_cal = calibrator.predict(preds)
-            auc_cal = roc_auc_score(y_val_seq, preds_cal)
-            if np.isfinite(auc_cal) and auc_cal >= auc:
-                auc = float(auc_cal)
-        except Exception:
-            calibrator = None
+            neural_model = NeuralSequenceModel(input_dim=len(feature_cols))
+            sequence_length = 12
 
-        trained_model = trained_model.to("cpu")
-        evaluated.append(
-            {
-                "name": "neural_sequence",
-                "pipeline": trained_model,
-                "auc": float(auc),
-                "acc": float(acc),
-                "sequence_length": sequence_length,
-                "device": "cpu",
-                "calibrator": calibrator,
-            }
-        )
-    except Exception as err:
-        print(f"Neural candidate training failed: {err}")
+            target = df["Close"].pct_change(horizon).shift(-horizon)
+            label = (target > 0).astype(int)
+            valid_mask = label.notna().to_numpy().copy()
+            valid_mask[-horizon:] = False
+
+            train_mask = np.zeros(len(df), dtype=bool)
+            train_mask[:train_rows] = True
+            train_mask &= valid_mask
+
+            train_idx = np.flatnonzero(train_mask)
+            if train_idx.size < 320:
+                raise ValueError("Insufficient training data for neural model")
+
+            val_size = max(int(train_idx.size * 0.2), 120)
+            if val_size >= train_idx.size:
+                raise ValueError("Insufficient validation data for neural model")
+
+            core_idx = train_idx[:-val_size]
+            val_idx = train_idx[-val_size:]
+
+            feat_df = df[feature_cols]
+            label_series = label
+
+            X_core = feat_df.iloc[core_idx]
+            y_core = label_series.iloc[core_idx]
+
+            X_val = feat_df.iloc[val_idx]
+            y_val = label_series.iloc[val_idx]
+
+            train_dataset = SequenceDataset(X_core, y_core, sequence_length=sequence_length)
+            val_dataset = SequenceDataset(X_val, y_val, sequence_length=sequence_length)
+
+            train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            trained_model = train_neural_model(
+                neural_model, train_loader, val_loader, epochs=10, lr=0.001, device=device
+            )
+
+            val_features = feat_df.iloc[val_idx].values
+            preds = neural_inference(trained_model, val_features, sequence_length=sequence_length, device=device)
+
+            y_val_seq = y_val[sequence_length:]
+            auc = roc_auc_score(y_val_seq, preds)
+            pred_labels = (preds >= 0.5).astype(int)
+            acc = accuracy_score(y_val_seq, pred_labels)
+
+            calibrator = None
+            try:
+                calibrator = IsotonicRegression(out_of_bounds="clip")
+                calibrator.fit(preds, np.asarray(y_val_seq, dtype=float))
+                preds_cal = calibrator.predict(preds)
+                auc_cal = roc_auc_score(y_val_seq, preds_cal)
+                if np.isfinite(auc_cal) and auc_cal >= auc:
+                    auc = float(auc_cal)
+            except Exception:
+                calibrator = None
+
+            trained_model = trained_model.to("cpu")
+            evaluated.append(
+                {
+                    "name": "neural_sequence",
+                    "pipeline": trained_model,
+                    "auc": float(auc),
+                    "acc": float(acc),
+                    "sequence_length": sequence_length,
+                    "device": "cpu",
+                    "calibrator": calibrator,
+                }
+            )
+        except Exception as err:
+            print(f"Neural candidate training failed: {err}")
+    elif TRAINING_MODE == "neural":
+        print("Neural candidate training skipped: torch is not installed in this environment")
 
 
 
@@ -1221,6 +883,8 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
         "auc": float(auc),
         "acc": float(acc),
         "weight": ml_weight,
+        "pipeline": best_pipeline,
+        "calibrator": calibrator,
         "raw": ml_component,
         "smoothed": ml_smoothed,
         "prob": pd.Series(full_probs, index=df.index),
@@ -1228,37 +892,15 @@ def _fit_ml_candidate(df: pd.DataFrame, train_rows: int, horizon: int, feature_c
     }
 
 
-def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int, ...] = (3, 6, 12)) -> None:
-    feature_cols = [
-        "score",
-        "trend",
-        "m3",
-        "m20",
-        "volume_bias",
-        "range_score",
-        "ret_3",
-        "ret_20",
-        "volatility",
-        "atr_pct",
-        "volume_z",
-        "ema_ratio",
-        "macd_hist",
-        "price_momentum",
-        "volume_trend",
-        "mtf_trend_1h",
-        "mtf_trend_4h",
-        "regime_trend",
-        "regime_chop",
-        "regime_high_vol",
-        "hour_sin",
-        "hour_cos",
-        "dow_sin",
-        "dow_cos",
-    ]
-
+def _blend_with_ml_signal(
+    df: pd.DataFrame,
+    train_rows: int,
+    horizons: tuple[int, ...] = (3, 6, 12),
+) -> dict[str, Any] | None:
+    feature_cols = list(DEFAULT_SIGNAL_FEATURE_COLUMNS)
     missing_cols = [c for c in feature_cols if c not in df.columns]
     if missing_cols:
-        return
+        return None
 
     base_score = df["score"].clip(-1.0, 1.0)
     candidates: list[dict[str, Any]] = []
@@ -1271,7 +913,7 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
 
     if not candidates:
         print("Hybrid ML signal skipped: no horizon met validation criteria")
-        return
+        return None
 
     candidates.sort(key=lambda item: (item["auc"], item["acc"]), reverse=True)
     primary = candidates[0]
@@ -1305,7 +947,7 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
 
     if sum_weights <= 0 or raw_combo is None or smooth_combo is None or prob_combo is None:
         print("Hybrid ML signal skipped: blend weights collapsed to zero")
-        return
+        return None
 
     combined_raw = (raw_combo / sum_weights).clip(-1.0, 1.0)
     combined_smoothed = (smooth_combo / sum_weights).clip(-1.0, 1.0)
@@ -1336,6 +978,25 @@ def _blend_with_ml_signal(df: pd.DataFrame, train_rows: int, horizons: tuple[int
         f"{blend_summary}"
         ")"
     )
+    if any(candidate["model"] == "neural_sequence" for candidate in blend_group):
+        return None
+
+    return {
+        "version": ARTIFACT_VERSION,
+        "feature_cols": feature_cols,
+        "effective_weight": float(effective_weight),
+        "candidates": [
+            {
+                "horizon": int(candidate["horizon"]),
+                "model": str(candidate["model"]),
+                "blend_weight": float(weight),
+                "smooth_span": 18,
+                "pipeline": candidate["pipeline"],
+                "calibrator": candidate.get("calibrator"),
+            }
+            for candidate, weight in zip(blend_group, weights)
+        ],
+    }
 
 
 from ml.model_orchestrator import ModelOrchestrator
@@ -1459,15 +1120,17 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
 
     baseline_variant_name = "classic_baseline" if mode_setting == "classic" else "baseline"
     variant_candidates: list[tuple[str, pd.DataFrame]] = [(baseline_variant_name, baseline_df.copy())]
+    variant_artifacts: dict[str, dict[str, Any] | None] = {baseline_variant_name: None}
 
     ml_applied = False
     if mode_setting != "classic":
         ml_df = baseline_df.copy()
-        _blend_with_ml_signal(ml_df, split)
+        blend_artifact = _blend_with_ml_signal(ml_df, split)
         ml_applied = "score_ml" in ml_df.columns
         if ml_applied:
             blend_name = "neural_blend" if mode_setting == "neural" else "ml_blend"
             variant_candidates.append((blend_name, ml_df))
+            variant_artifacts[blend_name] = blend_artifact
             ml_signal_df = baseline_df.copy()
             ml_signal_df["score"] = ml_df["score_ml"].copy()
             ml_signal_df["score_ml"] = ml_df["score_ml"].copy()
@@ -1475,6 +1138,12 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
                 ml_signal_df["score_ml_raw"] = ml_df["score_ml_raw"].copy()
             signal_name = "neural_signal_only" if mode_setting == "neural" else "ml_signal_only"
             variant_candidates.append((signal_name, ml_signal_df))
+            if blend_artifact is not None:
+                signal_artifact = deepcopy(blend_artifact)
+                signal_artifact["effective_weight"] = 1.0
+                variant_artifacts[signal_name] = signal_artifact
+            else:
+                variant_artifacts[signal_name] = None
         elif mode_setting == "neural":
             raise RuntimeError(
                 "Neural training mode requires a validated ML signal, but blend generation failed."
@@ -1822,6 +1491,29 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     else:
         print("[ORCHESTRATION] Candidate rejected by promotion/shadow stability gates.")
 
+    live_signal_artifact_saved = False
+    selected_artifact = variant_artifacts.get(selected_name)
+    if selected_artifact is not None:
+        artifact_payload = deepcopy(selected_artifact)
+        artifact_payload.update(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "period": period,
+                "variant": selected_name,
+                "training_profile": resolved_profile,
+                "threshold": float(best.threshold),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        )
+        LIVE_SIGNAL_ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(artifact_payload, LIVE_SIGNAL_ARTIFACT_PATH)
+        live_signal_artifact_saved = True
+        print(f"[ORCHESTRATION] Saved live signal artifact to {LIVE_SIGNAL_ARTIFACT_PATH}")
+    elif LIVE_SIGNAL_ARTIFACT_PATH.exists():
+        LIVE_SIGNAL_ARTIFACT_PATH.unlink()
+        print(f"[ORCHESTRATION] Cleared stale live signal artifact at {LIVE_SIGNAL_ARTIFACT_PATH}")
+
     result = {
         "symbol": symbol,
         "interval": interval,
@@ -1847,6 +1539,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         "training_profile": resolved_profile,
         "training_profile_requested": mode_setting,
         "training_label": TRAINING_LABEL or resolved_profile,
+        "live_signal_artifact": {
+            "path": str(LIVE_SIGNAL_ARTIFACT_PATH),
+            "saved": live_signal_artifact_saved,
+            "version": ARTIFACT_VERSION if live_signal_artifact_saved else None,
+        },
     }
 
     out_file = OUT_DIR / "latest.json"

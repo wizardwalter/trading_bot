@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/clawdbot/.openclaw/workspace/trading_bot
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 if [ -f logs/autonomous.pid ]; then
   PID="$(cat logs/autonomous.pid)"
   if kill -0 "$PID" 2>/dev/null; then

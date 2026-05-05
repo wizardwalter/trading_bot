@@ -8,8 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict
 
+import joblib
 import pandas as pd
-import yfinance as yf
+
+from ml.signal_engine import apply_signal_artifact, compute_market_features, derive_live_decision
+from services.market_data import download_market_data
+
+
+LIVE_SIGNAL_ARTIFACT_PATH = Path(os.getenv("LIVE_SIGNAL_ARTIFACT_PATH", "models/live_signal_artifact.pkl"))
+_LIVE_SIGNAL_CACHE: dict[str, object | None] = {"mtime": None, "artifact": None}
 
 
 @dataclass
@@ -24,59 +31,17 @@ class Signal:
 
 
 def _download(symbol: str, interval: str = "5m", period: str = "5d", retries: int = 3) -> pd.DataFrame:
-    last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            df = yf.download(
-                tickers=symbol,
-                interval=interval,
-                period=period,
-                progress=False,
-                threads=False,
-                auto_adjust=False,
-            )
-            if df.empty:
-                raise ValueError(f"No market data returned for {symbol}")
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-
-            for col in ["Open", "High", "Low", "Close", "Volume"]:
-                if col not in df.columns:
-                    raise ValueError(f"Missing {col} in market data for {symbol}")
-
-            cleaned = df.dropna().copy()
-            if cleaned.empty:
-                raise ValueError(f"Only NaN market data returned for {symbol}")
-            return cleaned
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(0.6 * attempt)
-
-    raise ValueError(f"Market data fetch failed for {symbol}: {last_err}")
+    return download_market_data(
+        symbol=symbol,
+        interval=interval,
+        period=period,
+        retries=retries,
+        source_pref=os.getenv("LIVE_DATA_SOURCE") or os.getenv("MARKET_DATA_SOURCE"),
+    )
 
 
 def _features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    out["ema_fast"] = out["Close"].ewm(span=12, adjust=False).mean()
-    out["ema_slow"] = out["Close"].ewm(span=26, adjust=False).mean()
-
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    out["rsi"] = 100 - (100 / (1 + rs))
-
-    out["ret_3"] = out["Close"].pct_change(3)
-    out["ret_20"] = out["Close"].pct_change(20)
-    out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
-    out["volatility"] = out["hl_spread"].rolling(20).mean()
-    out["range_high"] = out["Close"].rolling(48, min_periods=30).max()
-    out["range_low"] = out["Close"].rolling(48, min_periods=30).min()
-
-    return out.dropna()
+    return compute_market_features(df)
 
 
 def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: str | None = None) -> float:
@@ -95,11 +60,9 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
     if str(payload.get("symbol", "")).upper() != symbol.upper():
         return fallback
 
-    # Guard against applying a threshold calibrated for a different bar interval.
     if expected_interval and str(payload.get("interval", "")).lower() != str(expected_interval).lower():
         return fallback
 
-    # Guard against stale calibrations lingering for too long.
     max_age_hours = float(os.getenv("BACKTEST_MAX_AGE_HOURS", "72"))
     try:
         age_s = time.time() - path.stat().st_mtime
@@ -109,7 +72,6 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
         return fallback
 
     test_block = payload.get("test", {}) if isinstance(payload.get("test", {}), dict) else {}
-    # Reject calibrations that explicitly fail execution gates.
     if bool(test_block.get("do_not_trade", False)):
         return fallback
 
@@ -123,7 +85,6 @@ def _load_backtest_threshold(symbol: str, fallback: float, expected_interval: st
     if candidate is None:
         return fallback
 
-    # Keep thresholds in a sane range so stale/overfit backtests cannot brick execution.
     return float(min(max(float(candidate), 0.08), 0.60))
 
 
@@ -182,19 +143,10 @@ def _shadow_drift_penalty(symbol: str) -> float:
     broad_deterioration = avg_ret_72h < avg_ret_7d and avg_dd_72h < avg_dd_7d
 
     if drift_negative and drawdown_worse:
-        # Keep the response measured: +2% by default, escalating to +4% when
-        # deterioration is persistent across 24h/72h/7d windows.
         default_penalty = 0.04 if broad_deterioration else 0.02
-
-        # Add a small severity step when short-horizon decay is materially worse
-        # than medium horizon performance. This tightens entries by up to +1.5%
-        # without fully shutting off signal responsiveness.
         ret_gap = max(avg_ret_72h - avg_ret_24h, 0.0)
         dd_gap = max(avg_dd_72h - avg_dd_24h, 0.0)
         severe_decay = (ret_gap >= 0.0025) and (dd_gap >= 0.0025)
-
-        # Add one more gentle step when all windows are materially red so live
-        # execution throttles marginal entries until drift normalizes.
         sustained_stress = broad_deterioration and (avg_ret_24h <= -0.02) and (avg_dd_24h <= -0.04)
         penalty = default_penalty + (0.015 if severe_decay else 0.0) + (0.01 if sustained_stress else 0.0)
 
@@ -207,26 +159,41 @@ def _shadow_drift_penalty(symbol: str) -> float:
 def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
-        base = 0.16  # slightly stricter BTC threshold after negative drift to curb marginal entries
-        interval = "1m"
+        interval = os.getenv("BTC_LIVE_INTERVAL", os.getenv("TRAINING_BAR_INTERVAL", "5m"))
+        period = os.getenv("BTC_LIVE_PERIOD", "10d" if interval != "1m" else "3d")
+        base = float(os.getenv("BTC_BASE_ENTRY_THRESHOLD", "0.16"))
         drift_penalty = _shadow_drift_penalty(s)
-        adaptive_base = min(base + drift_penalty, 0.22)
+        adaptive_base = min(base + drift_penalty, base + 0.06)
         return {
             "interval": interval,
-            "period": "2d",
+            "period": period,
             "drift_penalty": drift_penalty,
-            # BTC live execution runs on 1m bars while backtests currently publish
-            # 5m calibrations; allow fresh backtest thresholds instead of always
-            # falling back to the static base.
-            "entry_threshold": _load_backtest_threshold(s, adaptive_base, expected_interval=None),
+            "entry_threshold": _load_backtest_threshold(s, adaptive_base, expected_interval=interval),
         }
-    # default day-trading profile for equities
+
+    interval = os.getenv("EQUITY_LIVE_INTERVAL", "5m")
     return {
-        "interval": "5m",
-        "period": "5d",
-        "entry_threshold": 0.12,
+        "interval": interval,
+        "period": os.getenv("EQUITY_LIVE_PERIOD", "5d"),
+        "entry_threshold": _load_backtest_threshold(s, 0.12, expected_interval=interval),
         "drift_penalty": 0.0,
     }
+
+
+def _interval_seconds(interval: str) -> int:
+    mapping = {
+        "1m": 60,
+        "2m": 120,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "60m": 3600,
+        "90m": 5400,
+        "1h": 3600,
+        "1d": 86400,
+        "daily": 86400,
+    }
+    return mapping.get(str(interval).lower(), 300)
 
 
 def _latest_bar_age_seconds(df: pd.DataFrame) -> float:
@@ -244,11 +211,52 @@ def _latest_bar_age_seconds(df: pd.DataFrame) -> float:
         return float("inf")
 
 
+def _load_live_signal_artifact(symbol: str, interval: str) -> dict | None:
+    if os.getenv("USE_LIVE_SIGNAL_ARTIFACT", "1") != "1":
+        return None
+    if not LIVE_SIGNAL_ARTIFACT_PATH.exists():
+        return None
+
+    try:
+        mtime = LIVE_SIGNAL_ARTIFACT_PATH.stat().st_mtime
+    except Exception:
+        return None
+
+    cached_mtime = _LIVE_SIGNAL_CACHE.get("mtime")
+    artifact = _LIVE_SIGNAL_CACHE.get("artifact")
+    if artifact is None or cached_mtime != mtime:
+        try:
+            artifact = joblib.load(LIVE_SIGNAL_ARTIFACT_PATH)
+        except Exception:
+            return None
+        _LIVE_SIGNAL_CACHE["mtime"] = mtime
+        _LIVE_SIGNAL_CACHE["artifact"] = artifact
+
+    if not isinstance(artifact, dict):
+        return None
+    if str(artifact.get("symbol", "")).upper() not in {"", symbol.upper()}:
+        return None
+    if str(artifact.get("interval", "")).lower() not in {"", str(interval).lower()}:
+        return None
+    return artifact
+
+
 def build_signal(symbol: str, has_position: bool = False) -> Signal:
     profile = _symbol_profile(symbol)
     df = _features(_download(symbol, interval=profile["interval"], period=profile["period"]))
 
-    max_staleness_s = float(os.getenv("MAX_MARKET_DATA_STALENESS_SECONDS", "240"))
+    artifact = _load_live_signal_artifact(symbol, profile["interval"])
+    artifact_note = ""
+    if artifact is not None:
+        try:
+            df = apply_signal_artifact(df, artifact)
+            artifact_note = f", artifact={artifact.get('variant', 'ml')}"
+        except Exception as exc:
+            artifact_note = f", artifact_error={exc}"
+
+    bar_seconds = _interval_seconds(profile["interval"])
+    default_staleness = max(240, int(bar_seconds * 2.5))
+    max_staleness_s = float(os.getenv("MAX_MARKET_DATA_STALENESS_SECONDS", str(default_staleness)))
     latest_age_s = _latest_bar_age_seconds(df)
     if latest_age_s > max_staleness_s:
         raise ValueError(
@@ -256,145 +264,21 @@ def build_signal(symbol: str, has_position: bool = False) -> Signal:
         )
 
     row = df.iloc[-1]
-
     price = float(row["Close"])
-    ema_fast = float(row["ema_fast"])
-    ema_slow = float(row["ema_slow"])
-    rsi = float(row["rsi"])
-    ret_3 = float(row["ret_3"])
-    ret_20 = float(row["ret_20"])
-    vol = max(float(row["volatility"]), 0.002)
-    range_high = float(row["range_high"])
-    range_low = float(row["range_low"])
-    range_width = max(range_high - range_low, max(price * 0.0005, 1e-6))
-    range_pos = max(min((price - range_low) / range_width, 1.2), -0.2)
-
-    trend_component = (ema_fast - ema_slow) / price
-    trend_component = max(min(trend_component * 220, 1.0), -1.0)
-
-    if rsi < 35:
-        rsi_component = 0.8
-    elif rsi > 68:
-        rsi_component = -0.8
-    else:
-        rsi_component = 0.0
-
-    momentum_component = max(min(ret_20 * 25, 1.0), -1.0)
-    short_momentum_component = max(min(ret_3 * 35, 1.0), -1.0)
-    range_drift_component = max(min(((range_pos - 0.5) * 1.8), 1.0), -1.0)
-    breakout_component = max(min(((price - range_high) / range_width) * 2.0, 1.0), -1.0)
-
-    score = (
-        (0.40 * trend_component)
-        + (0.20 * momentum_component)
-        + (0.18 * short_momentum_component)
-        + (0.12 * rsi_component)
-        + (0.06 * range_drift_component)
-        + (0.04 * breakout_component)
-    )
-
-    # Dynamic thresholds: per-symbol baseline + volatility penalty.
-    base_threshold = float(profile["entry_threshold"])
-    vol_penalty = min(max((vol - 0.01) * 8.0, 0.0), 0.10)
-    buy_threshold = base_threshold + vol_penalty
-    sell_threshold = -base_threshold - vol_penalty
-
-    # Oversold rebound bias: let BTC enter a little earlier on deep pullbacks
-    # when momentum is no longer strongly deteriorating.
-    oversold_rebound = (rsi < 30 and short_momentum_component > momentum_component + 0.10)
-    extreme_oversold_reversal = (rsi < 27 and short_momentum_component > -0.15)
-
-    # Avoid fresh long entries during euphoric spikes.
-    overbought_exhaustion = rsi > 78 and short_momentum_component > 0.10
-
-    # Exit logic: trim risk on clear downside, and also de-risk overbought conditions
-    # once short-term momentum stops accelerating higher.
-    overbought_exit = rsi > 74 and short_momentum_component < 0.08
-
-    bearish_confirmation = (trend_component < -0.03 and short_momentum_component < 0.0)
-
-    # Regime filter: avoid new entries in high-volatility downside chop where the
-    # current model historically overtrades and bleeds on fees/slippage.
-    # When shadow drift is negative, tighten the volatility guard incrementally.
-    drift_penalty = float(profile.get("drift_penalty", 0.0))
-    # Under sustained negative drift, tighten the volatility ceiling a bit more
-    # aggressively so the bot avoids chop-heavy entries.
-    risk_off_vol_threshold = max(0.0135, 0.018 - (0.08 * min(max(drift_penalty, 0.0), 0.05)))
-    risk_off_regime = (trend_component < -0.06 and momentum_component < -0.08) or vol > risk_off_vol_threshold
-
-    # Require at least one supportive regime signal for non-rebound buys.
-    bullish_alignment = (trend_component > 0.0) or (momentum_component > 0.0 and short_momentum_component > -0.05)
-
-    # Selective counter-trend allowance for washed-out reversals to avoid getting
-    # stuck in perpetual HOLD during deep but stabilizing pullbacks.
-    allow_countertrend_reversal = (
-        extreme_oversold_reversal
-        and vol < 0.03
-        and trend_component > -0.30
-    )
-
-    breakout_ready = price >= range_high * 0.998
-    breakdown_risk = price <= range_low * 1.002
-    compression_regime = (range_width / price) < 0.012
-    range_stop_trigger = has_position and (range_pos < 0.18 and short_momentum_component < -0.05)
-
-    if (
-        (score > buy_threshold or oversold_rebound or extreme_oversold_reversal)
-        and not overbought_exhaustion
-        and (not risk_off_regime or allow_countertrend_reversal)
-        and (bullish_alignment or oversold_rebound or extreme_oversold_reversal)
-        and (breakout_ready or range_pos > 0.45 or oversold_rebound or extreme_oversold_reversal)
-    ):
-        action = "buy"
-    elif (
-        overbought_exit
-        or (score < sell_threshold and bearish_confirmation)
-        or risk_off_regime
-        or range_stop_trigger
-        or (has_position and breakdown_risk and short_momentum_component < -0.02)
-    ):
-        action = "sell" if has_position else "hold"
-    else:
-        action = "hold"
-
-    # Suppress low-conviction long entries around neutral conditions, but do not mask
-    # explicit risk-off exits (sell threshold / overbought exit).
-    if action == "buy" and abs(score) < 0.06 and not (oversold_rebound or extreme_oversold_reversal):
-        action = "hold"
-
-    if action == "buy" and not (oversold_rebound or extreme_oversold_reversal):
-        if range_pos < 0.20 or (compression_regime and not breakout_ready and short_momentum_component < 0.04):
-            action = "hold"
-        if range_pos > 0.85 and short_momentum_component < 0.08 and not breakout_ready:
-            action = "hold"
-
-    base_confidence = min(max((abs(score) - 0.04) / 0.56, 0.0), 1.0)
-    setup_confidence_boost = 0.0
-    if oversold_rebound:
-        setup_confidence_boost = max(setup_confidence_boost, 0.07)
-    if extreme_oversold_reversal:
-        setup_confidence_boost = max(setup_confidence_boost, 0.10)
-    if overbought_exhaustion and action == "hold":
-        setup_confidence_boost = max(setup_confidence_boost, 0.05)
-
-    # Damp confidence under elevated volatility so execution/risk filters reject
-    # more borderline entries during noisy regimes.
-    vol_conf_penalty = min(max((vol - 0.015) * 15.0, 0.0), 0.20)
-    confidence = min(max(base_confidence + setup_confidence_boost - vol_conf_penalty, 0.0), 1.0)
+    decision = derive_live_decision(df, threshold=float(profile["entry_threshold"]), has_position=has_position)
     reason = (
-        f"trend={trend_component:+.2f}, momentum20={momentum_component:+.2f}, "
-        f"momentum3={short_momentum_component:+.2f}, rsi={rsi:.1f}, vol={vol:.4f}, score={score:+.2f}, "
-        f"thr=[{sell_threshold:+.2f},{buy_threshold:+.2f}], rng={range_pos:.2f}, conf={confidence:.2f}, age_s={latest_age_s:.0f}"
+        f"{decision['reason']}, interval={profile['interval']}, age_s={latest_age_s:.0f}, "
+        f"profile_thr={float(profile['entry_threshold']):.3f}{artifact_note}"
     )
 
     return Signal(
         symbol=symbol,
-        action=action,
+        action=str(decision["action"]),
         price=price,
-        confidence=confidence,
-        score=score,
+        confidence=float(decision["confidence"]),
+        score=float(decision["score"]),
         reason=reason,
-        volatility=vol,
+        volatility=float(decision["volatility"]),
     )
 
 

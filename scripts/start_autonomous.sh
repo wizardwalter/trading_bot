@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/clawdbot/.openclaw/workspace/trading_bot
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 
 PYTHON_BIN=""
 if [ -x ".venv/bin/python" ]; then
@@ -11,6 +12,8 @@ else
   echo "No python runtime found" >&2
   exit 1
 fi
+
+mkdir -p logs
 
 # Prevent duplicate runners
 if [ -f logs/autonomous.pid ] && kill -0 "$(cat logs/autonomous.pid)" 2>/dev/null; then

@@ -5,4 +5,8 @@ pandas
 yfinance
 numpy
 scikit-learn
+# Optional on lean boxes, but required for neural training mode.
 torch
+joblib
+ta
+xgboost
