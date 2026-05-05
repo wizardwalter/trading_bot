@@ -1492,8 +1492,11 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         print("[ORCHESTRATION] Candidate rejected by promotion/shadow stability gates.")
 
     live_signal_artifact_saved = False
+    artifact_validated = False
     selected_artifact = variant_artifacts.get(selected_name)
-    if selected_artifact is not None:
+    ml_backed_selected = selected_artifact is not None
+
+    if ml_backed_selected:
         artifact_payload = deepcopy(selected_artifact)
         artifact_payload.update(
             {
@@ -1508,8 +1511,33 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         )
         LIVE_SIGNAL_ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(artifact_payload, LIVE_SIGNAL_ARTIFACT_PATH)
+
+        # Hard parity check for ML-backed selected variants.
+        if not LIVE_SIGNAL_ARTIFACT_PATH.exists():
+            raise RuntimeError(
+                f"ML-backed variant selected but artifact missing after save: {LIVE_SIGNAL_ARTIFACT_PATH}"
+            )
+
+        loaded = joblib.load(LIVE_SIGNAL_ARTIFACT_PATH)
+        required = {
+            "symbol": symbol,
+            "interval": interval,
+            "variant": selected_name,
+            "threshold": float(best.threshold),
+        }
+        mismatches = {
+            k: (loaded.get(k), v)
+            for k, v in required.items()
+            if loaded.get(k) != v
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"ML artifact parity check failed: {mismatches}"
+            )
+
+        artifact_validated = True
         live_signal_artifact_saved = True
-        print(f"[ORCHESTRATION] Saved live signal artifact to {LIVE_SIGNAL_ARTIFACT_PATH}")
+        print(f"[ORCHESTRATION] Saved+validated live signal artifact at {LIVE_SIGNAL_ARTIFACT_PATH}")
     elif LIVE_SIGNAL_ARTIFACT_PATH.exists():
         LIVE_SIGNAL_ARTIFACT_PATH.unlink()
         print(f"[ORCHESTRATION] Cleared stale live signal artifact at {LIVE_SIGNAL_ARTIFACT_PATH}")
@@ -1542,6 +1570,8 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         "live_signal_artifact": {
             "path": str(LIVE_SIGNAL_ARTIFACT_PATH),
             "saved": live_signal_artifact_saved,
+            "validated": artifact_validated,
+            "ml_backed_selected": ml_backed_selected,
             "version": ARTIFACT_VERSION if live_signal_artifact_saved else None,
         },
     }
