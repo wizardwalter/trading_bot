@@ -207,7 +207,7 @@ def _shadow_drift_penalty(symbol: str) -> float:
 def _symbol_profile(symbol: str) -> dict:
     s = symbol.upper()
     if s == "BTC-USD":
-        base = 0.15  # slightly stricter BTC threshold after negative drift to curb marginal entries
+        base = 0.16  # slightly stricter BTC threshold after negative drift to curb marginal entries
         interval = "1m"
         drift_penalty = _shadow_drift_penalty(s)
         adaptive_base = min(base + drift_penalty, 0.22)
