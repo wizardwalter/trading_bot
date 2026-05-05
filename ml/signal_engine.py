@@ -344,6 +344,9 @@ def compute_target_position(df: pd.DataFrame, threshold: float, long_only_mode: 
         | (range_score > 0.18)
     )
 
+    max_trades_per_day = int(float(os.getenv("MAX_TRADES_PER_DAY", "2")))
+    day_trade_counts: dict[Any, int] = {}
+
     position = np.zeros(len(df), dtype=np.int8)
     state = 0
     cooldown = 0
@@ -352,11 +355,23 @@ def compute_target_position(df: pd.DataFrame, threshold: float, long_only_mode: 
         if cooldown > 0:
             cooldown -= 1
 
+        day_key = None
+        if isinstance(df.index, pd.DatetimeIndex):
+            ts = df.index[i]
+            ts = ts.tz_convert("UTC") if ts.tzinfo is not None else ts
+            day_key = ts.date()
+        day_count = day_trade_counts.get(day_key, 0)
+        can_open_trade = day_key is None or day_count < max_trades_per_day
+
         if state == 0:
-            if cooldown == 0 and long_entry[i]:
+            if cooldown == 0 and can_open_trade and long_entry[i]:
                 state = 1
-            elif cooldown == 0 and short_entry[i]:
+                if day_key is not None:
+                    day_trade_counts[day_key] = day_count + 1
+            elif cooldown == 0 and can_open_trade and short_entry[i]:
                 state = -1
+                if day_key is not None:
+                    day_trade_counts[day_key] = day_count + 1
         elif state == 1:
             if long_exit[i]:
                 state = 0
