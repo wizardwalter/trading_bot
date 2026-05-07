@@ -1396,6 +1396,16 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
         selected_variant = max(auto_candidates, key=_variant_key)
 
     selected_name, selected_df, best, test = selected_variant
+    baseline_entry = next(item for item in variant_results if item[0] == baseline_variant_name)
+
+    # Fail-closed selection: never treat non-deployable candidates as active selection.
+    if bool(test.do_not_trade) or float(test.profit_factor) < 1.0:
+        print(
+            "[ORCHESTRATION] Fail-closed: selected variant is non-deployable "
+            f"(do_not_trade={test.do_not_trade}, pf={test.profit_factor:.2f}); "
+            f"falling back to {baseline_variant_name}."
+        )
+        selected_name, selected_df, best, test = baseline_entry
 
     if mode_setting == "classic":
         resolved_profile = "classic"
@@ -1404,7 +1414,6 @@ def run(symbol: str = "BTC-USD", interval: str = "5m", period: str = "60d", trai
     else:
         resolved_profile = "neural" if selected_name != baseline_variant_name else "classic"
 
-    baseline_entry = next(item for item in variant_results if item[0] == baseline_variant_name)
     _, _, baseline_best, baseline_test = baseline_entry
 
     improvement = test.total_return - baseline_test.total_return
