@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from v3_btc_accumulator.config import V3Config
+from config import V3Config
 
 OUT = Path('v3_btc_accumulator/out')
 OUT.mkdir(parents=True, exist_ok=True)
