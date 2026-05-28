@@ -13,6 +13,7 @@ OUT = Path('v3_btc_accumulator/out')
 OUT.mkdir(parents=True, exist_ok=True)
 RUNS_JSONL = OUT / 'training_runs.jsonl'
 LATEST_JSON = OUT / 'latest_v3.json'
+STATE_JSON = OUT / 'state.json'
 
 @dataclass
 class Metrics:
@@ -188,20 +189,41 @@ def run_once(cfg: V3Config) -> dict:
     started = datetime.now(timezone.utc)
     base = _load_data()
 
+    state = {'run_seq': 0}
+    if STATE_JSON.exists():
+        try:
+            state = json.loads(STATE_JSON.read_text())
+        except Exception:
+            state = {'run_seq': 0}
+    run_seq = int(state.get('run_seq', 0)) + 1
+    state['run_seq'] = run_seq
+    STATE_JSON.write_text(json.dumps(state))
+
     window_specs = [
         ('1m', 30), ('5m', 60), ('15m', 60), ('1h', 90)
     ]
 
+    # single-family candidate sweep: entry lookback and scalp tranche
+    lookback_candidates = [72, 96, 120]
+    tranche_candidates = [0.10, 0.15, 0.20]
+    chosen_lookback = lookback_candidates[run_seq % len(lookback_candidates)]
+    chosen_tranche = tranche_candidates[run_seq % len(tranche_candidates)]
+    cfg.support_resistance_lookback = chosen_lookback
+    cfg.max_scalp_tranche_pct = chosen_tranche
+
     runs = []
     for tf, days in window_specs:
+        # rolling shift to avoid deterministic replay
+        shift = (run_seq * 37) % max(1, len(base)//6)
+        b = base.iloc[:-shift] if shift > 0 and len(base) - shift > 300 else base
         if tf == '1m':
-            d = base.resample('1min').last().dropna().tail(days * 24 * 60)
+            d = b.resample('1min').last().dropna().tail(days * 24 * 60)
         elif tf == '5m':
-            d = base.resample('5min').last().dropna().tail(days * 24 * 12)
+            d = b.resample('5min').last().dropna().tail(days * 24 * 12)
         elif tf == '15m':
-            d = base.resample('15min').last().dropna().tail(days * 24 * 4)
+            d = b.resample('15min').last().dropna().tail(days * 24 * 4)
         else:
-            d = base.resample('1h').last().dropna().tail(days * 24)
+            d = b.resample('1h').last().dropna().tail(days * 24)
         if len(d) < 200:
             continue
         runs.append(_simulate_window(d, cfg, tf))
@@ -254,6 +276,8 @@ def run_once(cfg: V3Config) -> dict:
     )
     payload = asdict(out)
     payload['windows'] = runs
+    payload['window_id'] = f"seq-{run_seq}"
+    payload['candidate'] = {'support_resistance_lookback': chosen_lookback, 'max_scalp_tranche_pct': chosen_tranche}
 
     with RUNS_JSONL.open('a') as f:
         f.write(json.dumps(payload) + '\n')
